@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gofing — Local Network Discovery & Fing Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header Navbar -->
+    <header class="navbar">
+      <div class="brand">
+        <div class="logo-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"></path>
+            <path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"></path>
+            <path d="M12 2v2"></path>
+            <path d="M12 20v2"></path>
+            <path d="m4.93 4.93 1.41 1.41"></path>
+            <path d="m17.66 17.66 1.41 1.41"></path>
+            <path d="M2 12h2"></path>
+            <path d="M20 12h2"></path>
+          </svg>
+        </div>
+        <span class="brand-title">Gofing</span>
+        <span class="brand-badge">macOS Native</span>
+      </div>
+
+      <div class="network-meta-pill" id="networkPill">
+        <span class="wifi-icon">📶</span>
+        <span id="ssidName">Detecting Network...</span>
+        <span class="meta-divider">•</span>
+        <span id="subnetCidr">...</span>
+      </div>
+
+      <div class="nav-actions">
+        <button id="rescanBtn" class="btn-primary">
+          <svg class="spin-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
+          </svg>
+          <span id="scanBtnText">Scan Network</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Scan Progress Bar -->
+    <div class="progress-bar-container" id="progressContainer">
+      <div class="progress-bar-fill" id="progressBarFill"></div>
+    </div>
+
+    <!-- Metrics Cards Grid -->
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-label">Total Devices</div>
+        <div class="metric-value" id="statTotal">0</div>
+        <div class="metric-sub">Found on current subnet</div>
+      </div>
+      <div class="metric-card green-accent">
+        <div class="metric-label">Online Devices</div>
+        <div class="metric-value text-green" id="statOnline">0</div>
+        <div class="metric-sub"><span class="pulse-dot inline-dot"></span> Active right now</div>
+      </div>
+      <div class="metric-card gray-accent">
+        <div class="metric-label">Offline Devices</div>
+        <div class="metric-value text-muted" id="statOffline">0</div>
+        <div class="metric-sub">Previously seen</div>
+      </div>
+      <div class="metric-card blue-accent">
+        <div class="metric-label">Default Gateway</div>
+        <div class="metric-value text-blue" id="statGateway">—</div>
+        <div class="metric-sub" id="statLocalIP">My IP: —</div>
+      </div>
+    </section>
+
+    <!-- Controls Bar (Search & Category Filters) -->
+    <section class="controls-section">
+      <div class="search-box">
+        <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input type="text" id="searchInput" placeholder="Search by name, IP, MAC address, vendor, or model..." />
+      </div>
+
+      <div class="category-pills" id="categoryPills">
+        <button class="pill active" data-category="all">All Devices</button>
+        <button class="pill" data-category="online">Online</button>
+        <button class="pill" data-category="router">Routers</button>
+        <button class="pill" data-category="computer">Computers</button>
+        <button class="pill" data-category="mobile">Mobile</button>
+        <button class="pill" data-category="tv">Smart TV</button>
+        <button class="pill" data-category="speaker">Audio</button>
+        <button class="pill" data-category="printer">Printers</button>
+        <button class="pill" data-category="iot">Smart Home</button>
+      </div>
+    </section>
+
+    <!-- Main Device List Table -->
+    <main class="table-container">
+      <table class="device-table">
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Device Name</th>
+            <th>Vendor / Model</th>
+            <th>Status</th>
+            <th>IP Address</th>
+            <th>MAC Address</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="deviceTableBody">
+          <tr class="empty-row">
+            <td colspan="7">Scanning network... Please wait.</td>
+          </tr>
+        </tbody>
+      </table>
+    </main>
+  </div>
+
+  <!-- Device Detail Modal -->
+  <div class="modal-backdrop" id="deviceModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon" id="modalTypeIcon">💻</div>
+          <div>
+            <h2 id="modalDeviceName">Device Details</h2>
+            <span class="modal-subtitle" id="modalDeviceSub">Subnet Device</span>
+          </div>
+        </div>
+        <button class="modal-close" id="modalCloseBtn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-grid">
+          <div class="modal-info-item">
+            <span class="info-label">IP Address</span>
+            <div class="copy-val-group">
+              <span class="info-value font-mono" id="modalIP">—</span>
+              <button class="btn-copy" id="copyIPBtn" title="Copy IP Address">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">MAC Address</span>
+            <div class="copy-val-group">
+              <span class="info-value font-mono" id="modalMAC">—</span>
+              <button class="btn-copy" id="copyMACBtn" title="Copy MAC Address">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">Hardware Vendor</span>
+            <span class="info-value" id="modalVendor">—</span>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">Model Fingerprint</span>
+            <span class="info-value" id="modalModel">—</span>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">Ping Latency</span>
+            <span class="info-value text-green" id="modalLatency">—</span>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">Status</span>
+            <span class="info-value" id="modalStatus">—</span>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">First Discovered</span>
+            <span class="info-value" id="modalFirstSeen">—</span>
+          </div>
+          <div class="modal-info-item">
+            <span class="info-label">Last Active</span>
+            <span class="info-value" id="modalLastSeen">—</span>
+          </div>
+        </div>
+
+        <div class="modal-section-title">Discovered Services & Tags</div>
+        <div class="services-tags-container" id="modalServices">
+          <span class="tag">ICMP Ping</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
