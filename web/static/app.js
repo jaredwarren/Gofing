@@ -1,4 +1,4 @@
-// Gofing - Real-Time Dashboard Client Logic with Simple Icons integration
+// Gofing - Real-Time Dashboard Client Logic with Dynamic Category Pills
 document.addEventListener('DOMContentLoaded', () => {
   let devicesMap = new Map();
   let currentCategory = 'all';
@@ -18,6 +18,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const scanBtnText = document.getElementById('scanBtnText');
   const progressContainer = document.getElementById('progressContainer');
   const progressBarFill = document.getElementById('progressBarFill');
+  const categoryPillsContainer = document.getElementById('categoryPills');
 
   // Modal elements
   const deviceModal = document.getElementById('deviceModal');
@@ -79,12 +80,13 @@ document.addEventListener('DOMContentLoaded', () => {
     renderTable();
   });
 
-  // Category Pills handler
-  document.getElementById('categoryPills').addEventListener('click', (e) => {
-    if (e.target.classList.contains('pill')) {
+  // Category Pills delegation handler
+  categoryPillsContainer.addEventListener('click', (e) => {
+    const pill = e.target.closest('.pill');
+    if (pill) {
       document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
-      e.target.classList.add('active');
-      currentCategory = e.target.dataset.category;
+      pill.classList.add('active');
+      currentCategory = pill.dataset.category;
       renderTable();
     }
   });
@@ -123,6 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
       .then(data => {
         if (data.devices) {
           data.devices.forEach(dev => devicesMap.set(dev.ip, dev));
+          updateCategoryPills();
           renderTable();
           updateMetrics();
         }
@@ -140,6 +143,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = JSON.parse(e.data);
       if (data.devices) {
         data.devices.forEach(dev => devicesMap.set(dev.ip, dev));
+        updateCategoryPills();
         renderTable();
         updateMetrics();
       }
@@ -161,6 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
     eventSource.addEventListener('device_found', (e) => {
       const dev = JSON.parse(e.data);
       devicesMap.set(dev.ip, dev);
+      updateCategoryPills();
       renderTable();
       updateMetrics();
     });
@@ -168,6 +173,7 @@ document.addEventListener('DOMContentLoaded', () => {
     eventSource.addEventListener('device_updated', (e) => {
       const dev = JSON.parse(e.data);
       devicesMap.set(dev.ip, dev);
+      updateCategoryPills();
       renderTable();
       updateMetrics();
     });
@@ -223,19 +229,43 @@ document.addEventListener('DOMContentLoaded', () => {
     statOfflineEl.textContent = offline;
   }
 
+  function updateCategoryPills() {
+    const devices = Array.from(devicesMap.values());
+    const typeCounts = new Map();
+
+    let onlineCount = 0;
+    devices.forEach(d => {
+      if (d.is_online) onlineCount++;
+      const t = d.device_type || 'Generic Device';
+      typeCounts.set(t, (typeCounts.get(t) || 0) + 1);
+    });
+
+    const categories = [
+      { id: 'all', label: `All Devices (${devices.length})` },
+      { id: 'online', label: `Online (${onlineCount})` }
+    ];
+
+    // Sort present device types by count descending
+    const sortedTypes = Array.from(typeCounts.entries()).sort((a, b) => b[1] - a[1]);
+    sortedTypes.forEach(([type, count]) => {
+      categories.push({ id: type, label: `${type} (${count})` });
+    });
+
+    categoryPillsContainer.innerHTML = categories.map(cat => {
+      const activeClass = (cat.id === currentCategory) ? 'active' : '';
+      return `<button class="pill ${activeClass}" data-category="${escapeHtml(cat.id)}">${escapeHtml(cat.label)}</button>`;
+    }).join('');
+  }
+
   function renderTable() {
     const devices = Array.from(devicesMap.values());
 
     const filtered = devices.filter(dev => {
+      // Dynamic category filter
       if (currentCategory === 'online' && !dev.is_online) return false;
-      if (currentCategory === 'router' && dev.device_type !== 'Router') return false;
-      if (currentCategory === 'computer' && dev.device_type !== 'Computer') return false;
-      if (currentCategory === 'mobile' && !['Mobile Phone', 'Tablet', 'Smartwatch'].includes(dev.device_type)) return false;
-      if (currentCategory === 'tv' && dev.device_type !== 'Smart TV') return false;
-      if (currentCategory === 'speaker' && dev.device_type !== 'Smart Speaker') return false;
-      if (currentCategory === 'printer' && dev.device_type !== 'Printer') return false;
-      if (currentCategory === 'iot' && dev.device_type !== 'Smart Home / IoT') return false;
+      if (currentCategory !== 'all' && currentCategory !== 'online' && dev.device_type !== currentCategory) return false;
 
+      // Search query filter
       if (searchQuery) {
         const haystack = `${dev.hostname} ${dev.ip} ${dev.mac} ${dev.vendor} ${dev.model} ${dev.device_type}`.toLowerCase();
         if (!haystack.includes(searchQuery)) return false;
@@ -374,7 +404,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const slug = simpleIconSlugs[vendorLower];
 
     if (slug) {
-      // Return Simple Icons SVG via CDN image or inline template
       return `<img class="simple-icon" src="https://cdn.jsdelivr.net/npm/simple-icons@v11/icons/${slug}.svg" width="${size}" height="${size}" alt="${dev.vendor}" onerror="this.outerHTML=getCategorySVG('${dev.icon}', '${dev.device_type}', ${size})" />`;
     }
 
@@ -411,7 +440,6 @@ document.addEventListener('DOMContentLoaded', () => {
       return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg>`;
     }
 
-    // Default network device icon
     return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>`;
   }
 

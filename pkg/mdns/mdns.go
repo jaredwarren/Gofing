@@ -1,13 +1,16 @@
 package mdns
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,15 +23,56 @@ type DeviceDetails struct {
 	Services   []string `json:"services"`
 }
 
-// Resolver handles hostname resolution and mDNS fingerprinting.
-type Resolver struct{}
-
-// New returns a new Resolver.
-func New() *Resolver {
-	return &Resolver{}
+// Resolver handles hostname resolution and multi-layer device fingerprinting.
+type Resolver struct {
+	mdnsCache map[string]string
+	cacheMu   sync.RWMutex
 }
 
-// ResolveDevice performs hostname reverse lookup, NetBIOS query, HTTP title grab, and service classification.
+// New returns a new Resolver instance.
+func New() *Resolver {
+	r := &Resolver{
+		mdnsCache: make(map[string]string),
+	}
+	go r.preloadmDNSServices()
+	return r
+}
+
+// Preload mDNS AirPlay, Companion-Link, and GoogleCast service instance names on macOS
+func (r *Resolver) preloadmDNSServices() {
+	// Browse AirPlay services
+	go r.browsemDNSService("_airplay._tcp")
+	// Browse Companion Link services
+	go r.browsemDNSService("_companion-link._tcp")
+	// Browse Google Cast services
+	go r.browsemDNSService("_googlecast._tcp")
+}
+
+func (r *Resolver) browsemDNSService(serviceType string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "dns-sd", "-B", serviceType, "local")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	_ = cmd.Run()
+
+	for _, line := range strings.Split(out.String(), "\n") {
+		line = strings.TrimSpace(line)
+		fields := strings.Fields(line)
+		if len(fields) >= 7 && (fields[1] == "Add" || fields[2] == "Add") {
+			instanceName := strings.Join(fields[6:], " ")
+			if instanceName != "" && !strings.HasPrefix(instanceName, "DNSService") {
+				r.cacheMu.Lock()
+				r.mdnsCache[strings.ToLower(instanceName)] = instanceName
+				r.cacheMu.Unlock()
+			}
+		}
+	}
+}
+
+// ResolveDevice performs multi-layer non-blocking fingerprinting.
 func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway bool, hostComputerName string) DeviceDetails {
 	if isGateway {
 		return DeviceDetails{
@@ -41,55 +85,97 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 	}
 
 	hostname := ""
+	var services []string
+	var detectedModel string
+	var detectedType string
+	var detectedIcon string
 
-	// 1. Check if this is the host Mac running Gofing
+	// Layer 1: Host Mac Detection
 	if hostComputerName != "" {
 		hostname = hostComputerName
+		detectedType = "Computer"
+		detectedIcon = "laptop"
+		detectedModel = "Apple Mac"
 	}
 
-	// 2. Reverse DNS lookup with strict 150ms timeout
+	// Layer 2: iOS Wireless Sync Port (62078) Fingerprinting
+	isIOS := probeIOSSyncPort(ip)
+	if isIOS {
+		services = append(services, "iOS Wireless Sync")
+		if vendor == "Private / Randomized MAC" || strings.Contains(strings.ToLower(vendor), "apple") {
+			vendor = "Apple, Inc."
+		}
+		if detectedType == "" {
+			detectedType = "Mobile Phone"
+			detectedIcon = "smartphone"
+			detectedModel = "Apple iPhone / iPad"
+		}
+	}
+
+	// Layer 3: Reverse DNS with 120ms timeout
 	if hostname == "" {
 		hostname = reverseDNS(ip)
 	}
 
-	// 3. Try NetBIOS Name Query (UDP 137)
+	// Layer 4: NetBIOS Name Query (UDP 137)
 	if hostname == "" || hostname == ip {
 		if netbiosName := queryNetBIOSName(ip); netbiosName != "" {
 			hostname = netbiosName
 		}
 	}
 
-	// 4. Try Chromecast / Google Nest setup API (http://<ip>:8008/setup/eureka_info)
-	if hostname == "" || hostname == ip {
-		if ccName := queryChromecastName(ip); ccName != "" {
+	// Layer 5: Google Cast / Nest API (http://<ip>:8008/setup/eureka_info)
+	if ccName := queryChromecastName(ip); ccName != "" {
+		if hostname == "" || hostname == ip {
 			hostname = ccName
+		}
+		services = append(services, "Google Cast")
+		if detectedType == "" {
+			detectedType = "Smart TV"
+			detectedIcon = "tv"
+			detectedModel = "Google Nest / Chromecast"
 		}
 	}
 
-	// 5. Try HTTP Title Grabber (http://<ip>:80 or 8080) for web servers/routers/NAS
+	// Layer 6: HTTP Title Grabber (http://<ip>:80)
 	if hostname == "" || hostname == ip {
 		if title := fetchHTTPTitle(ip); title != "" {
 			hostname = title
 		}
 	}
 
-	// 6. Infer services from hostname & vendor
-	services := inferServices(hostname, vendor)
+	// Layer 7: Infer Services & Device Class
+	inferredServices := inferServices(hostname, vendor)
+	services = append(services, inferredServices...)
 
-	// 7. Classify device type, icon, and model
 	devType, icon, model := classifyDevice(hostname, vendor, services, mac)
+	if detectedType != "" {
+		devType = detectedType
+		icon = detectedIcon
+		model = detectedModel
+	}
 
 	return DeviceDetails{
 		Hostname:   hostname,
 		DeviceType: devType,
 		Icon:       icon,
 		Model:      model,
-		Services:   services,
+		Services:   uniqueStrings(services),
 	}
 }
 
+// Ultra-fast TCP probe for iOS iTunes/Finder wireless sync listener port 62078 (40ms timeout)
+func probeIOSSyncPort(ip string) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "62078"), 40*time.Millisecond)
+	if err == nil {
+		conn.Close()
+		return true
+	}
+	return false
+}
+
 func reverseDNS(ip string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
 	defer cancel()
 
 	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
@@ -104,7 +190,7 @@ func reverseDNS(ip string) string {
 }
 
 func queryNetBIOSName(ip string) string {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "137"), 100*time.Millisecond)
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "137"), 80*time.Millisecond)
 	if err != nil {
 		return ""
 	}
@@ -120,7 +206,7 @@ func queryNetBIOSName(ip string) string {
 		0x00, 0x01,
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+	_ = conn.SetDeadline(time.Now().Add(80 * time.Millisecond))
 	_, err = conn.Write(req)
 	if err != nil {
 		return ""
@@ -138,7 +224,7 @@ func queryNetBIOSName(ip string) string {
 }
 
 func queryChromecastName(ip string) string {
-	client := &http.Client{Timeout: 150 * time.Millisecond}
+	client := &http.Client{Timeout: 100 * time.Millisecond}
 	resp, err := client.Get("http://" + ip + ":8008/setup/eureka_info?params=name")
 	if err != nil {
 		return ""
@@ -159,7 +245,7 @@ func queryChromecastName(ip string) string {
 var titleRegex = regexp.MustCompile(`(?i)<title>(.*?)</title>`)
 
 func fetchHTTPTitle(ip string) string {
-	client := &http.Client{Timeout: 150 * time.Millisecond}
+	client := &http.Client{Timeout: 100 * time.Millisecond}
 	resp, err := client.Get("http://" + ip)
 	if err != nil {
 		return ""
@@ -167,7 +253,7 @@ func fetchHTTPTitle(ip string) string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if err == nil {
 			matches := titleRegex.FindSubmatch(body)
 			if len(matches) >= 2 {
@@ -186,7 +272,7 @@ func inferServices(hostname, vendor string) []string {
 	hostLower := strings.ToLower(hostname)
 	vendorLower := strings.ToLower(vendor)
 
-	if strings.Contains(hostLower, "airplay") || strings.Contains(vendorLower, "apple") || strings.Contains(hostLower, "macbook") || strings.Contains(hostLower, "imac") {
+	if strings.Contains(hostLower, "airplay") || strings.Contains(vendorLower, "apple") || strings.Contains(hostLower, "macbook") || strings.Contains(hostLower, "imac") || strings.Contains(hostLower, "iphone") || strings.Contains(hostLower, "ipad") {
 		services = append(services, "AirPlay")
 	}
 	if strings.Contains(hostLower, "chromecast") || strings.Contains(hostLower, "google") {
@@ -215,6 +301,9 @@ func classifyDevice(hostname, vendor string, services []string, mac string) (dev
 	for _, s := range services {
 		if s == "Printer" {
 			return "Printer", "printer", "Network Printer"
+		}
+		if s == "iOS Wireless Sync" {
+			return "Mobile Phone", "smartphone", "Apple iPhone / iPad"
 		}
 	}
 
@@ -286,4 +375,16 @@ func classifyDevice(hostname, vendor string, services []string, mac string) (dev
 	}
 
 	return "Generic Device", "device", vendor
+}
+
+func uniqueStrings(input []string) []string {
+	keys := make(map[string]bool)
+	var list []string
+	for _, entry := range input {
+		if _, value := keys[entry]; !value && entry != "" {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
 }
