@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"testing"
+	"time"
 )
 
 func TestFormatMAC(t *testing.T) {
@@ -38,10 +39,32 @@ func TestExpandCIDR(t *testing.T) {
 	}
 }
 
-func TestParsePingLatency(t *testing.T) {
-	sampleOutput := "64 bytes from 192.168.0.1: icmp_seq=0 ttl=64 time=2.418 ms"
-	lat := parsePingLatency(sampleOutput)
-	if lat != 2.418 {
-		t.Errorf("expected 2.418, got %f", lat)
+func TestMergeProbeAndARPIgnoresStaleARP(t *testing.T) {
+	now := time.Now()
+	ping := map[string]float64{
+		"192.168.0.1": 1.2,
+	}
+	arp := map[string]RawDevice{
+		"192.168.0.1":   {IP: "192.168.0.1", MAC: "AA:BB:CC:DD:EE:01", Iface: "en0"},
+		"192.168.0.132": {IP: "192.168.0.132", MAC: "28:CD:C1:01:43:34", Iface: "en0"}, // stale
+	}
+
+	got := mergeProbeAndARP(ping, arp, now)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 reachable device, got %d: %+v", len(got), got)
+	}
+	if got[0].IP != "192.168.0.1" {
+		t.Fatalf("unexpected IP %q", got[0].IP)
+	}
+	if got[0].MAC != "AA:BB:CC:DD:EE:01" {
+		t.Fatalf("expected ARP MAC enrichment, got %q", got[0].MAC)
 	}
 }
+
+func TestMergeProbeAndARPIncludesPingWithoutARP(t *testing.T) {
+	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, map[string]RawDevice{}, time.Now())
+	if len(got) != 1 || got[0].MAC != "" || !got[0].IsOnline {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+

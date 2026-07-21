@@ -291,6 +291,7 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	for _, d := range wentOffline {
 		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 		e.emitEvent("device_offline", d)
+		e.emitEvent("device_updated", d) // keep UI clients that only listen for updates in sync
 	}
 	for _, d := range allDevices {
 		e.persistDevice(d)

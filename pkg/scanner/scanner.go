@@ -33,7 +33,10 @@ func New() *Scanner {
 	return &Scanner{}
 }
 
-// PerformScan executes a ping sweep across the subnet to populate ARP, then reads the ARP table.
+// PerformScan executes a ping sweep across the subnet, then uses the ARP table
+// only to enrich MAC addresses. A host is considered present only if it
+// responded to a reachability probe — stale ARP cache entries alone are not
+// enough (macOS retains ARP rows for minutes after a device disconnects).
 func (s *Scanner) PerformScan(subnetCIDR string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
 	ips, err := expandCIDR(subnetCIDR)
 	if err != nil {
@@ -43,47 +46,37 @@ func (s *Scanner) PerformScan(subnetCIDR string, progressCb func(scannedCount, t
 	// 1. Fast Ping Sweep across subnet using parallel worker pool
 	pingResults := s.pingSweep(ips, progressCb)
 
-	// 2. Parse macOS ARP table
+	// 2. Parse macOS ARP table for MAC enrichment only
+	arpByIP := make(map[string]RawDevice)
 	arpDevices, err := s.parsemacOSARPTable()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ARP table: %w", err)
 	}
-
-	// Combine ping results with ARP table
-	deviceMap := make(map[string]*RawDevice)
-
-	// Add ARP devices
 	for _, dev := range arpDevices {
-		devCopy := dev
-		deviceMap[dev.IP] = &devCopy
+		arpByIP[dev.IP] = dev
 	}
 
-	// Enrich/Add ping sweep results
-	now := time.Now()
-	for ip, lat := range pingResults {
-		if dev, exists := deviceMap[ip]; exists {
-			dev.IsOnline = true
-			dev.LatencyMs = lat
-			dev.LastSeen = now
-		} else {
-			// Device responded to ping but MAC wasn't in ARP
-			deviceMap[ip] = &RawDevice{
-				IP:        ip,
-				MAC:       "",
-				LatencyMs: lat,
-				IsOnline:  true,
-				LastSeen:  now,
-			}
-		}
-	}
+	return mergeProbeAndARP(pingResults, arpByIP, time.Now()), nil
+}
 
-	// Convert map to slice
+// mergeProbeAndARP returns only hosts that answered a probe, enriched with ARP MACs.
+// ARP-only entries (stale cache) are intentionally excluded.
+func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevice, now time.Time) []RawDevice {
 	var result []RawDevice
-	for _, dev := range deviceMap {
-		result = append(result, *dev)
+	for ip, lat := range pingResults {
+		dev := RawDevice{
+			IP:        ip,
+			LatencyMs: lat,
+			IsOnline:  true,
+			LastSeen:  now,
+		}
+		if arp, ok := arpByIP[ip]; ok {
+			dev.MAC = arp.MAC
+			dev.Iface = arp.Iface
+		}
+		result = append(result, dev)
 	}
-
-	return result, nil
+	return result
 }
 
 func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) map[string]float64 {
