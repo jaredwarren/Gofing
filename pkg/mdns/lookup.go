@@ -75,6 +75,16 @@ func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
 		consider(h, NameSourceDNS)
 	}
 
+	if ccName := SanitizeHostname(queryChromecastName(ip)); ccName != "" {
+		consider(ccName, NameSourceCast)
+	}
+	if title := SanitizeHostname(fetchHTTPTitle(ip)); title != "" {
+		consider(title, NameSourceHTTP)
+	}
+	if nbName := queryNetBIOSName(ip); nbName != "" {
+		consider(nbName, NameSourceARP)
+	}
+
 	if bestName != "" {
 		r.rememberIPName(ip, bestName, bestSrc)
 	}

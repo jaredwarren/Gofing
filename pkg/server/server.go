@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -222,7 +223,7 @@ func (s *Server) handlePortScan(w http.ResponseWriter, r *http.Request, id strin
 	}
 	mode = strings.ToLower(mode)
 
-	started, err := s.devEngine.TryStartPortScan(id, mode)
+	started, err := s.devEngine.TryStartPortScan(r.Context(), id, mode)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -260,7 +261,7 @@ func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		_, _ = s.devEngine.PerformScan(info)
+		_, _ = s.devEngine.PerformScan(context.Background(), info)
 	}()
 
 	writeJSON(w, map[string]string{
@@ -285,7 +286,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.sseMu.Lock()
 		delete(s.sseClients, clientChan)
 		s.sseMu.Unlock()
-		close(clientChan)
 	}()
 
 	initialBytes, _ := json.Marshal(map[string]interface{}{

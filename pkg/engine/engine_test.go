@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -171,7 +172,7 @@ func TestScanDevicePortsCommon(t *testing.T) {
 		DeviceType: "Computer",
 	}, "Unknown", now, nil)
 
-	open, err := eng.ScanDevicePorts("00:11:22:33:44:55", "common")
+	open, err := eng.ScanDevicePorts(context.Background(), "00:11:22:33:44:55", "common")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +188,7 @@ func TestScanDevicePortsCommon(t *testing.T) {
 func TestScanDevicePortsInvalidMode(t *testing.T) {
 	eng := New(nil)
 	eng.upsertDevice(scanner.RawDevice{IP: "127.0.0.1", MAC: "00:11:22:33:44:66"}, mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
-	_, err := eng.ScanDevicePorts("00:11:22:33:44:66", "weird")
+	_, err := eng.ScanDevicePorts(context.Background(), "00:11:22:33:44:66", "weird")
 	if err == nil {
 		t.Fatal("expected invalid mode error")
 	}
@@ -202,16 +203,12 @@ func TestResolveDeviceNameMissing(t *testing.T) {
 }
 
 func TestResolveDeviceNameKeepsExistingWhenMiss(t *testing.T) {
-	prevWarm := warmHostFn
-	prevDeep := deepLookupFn
-	warmHostFn = func(string) {}
-	deepLookupFn = func(*mdns.Resolver, string) mdns.LookupResult { return mdns.LookupResult{} }
-	t.Cleanup(func() {
-		warmHostFn = prevWarm
-		deepLookupFn = prevDeep
-	})
-
 	eng := New(nil)
+	eng.SetTestHooks(
+		func(string) {},
+		func(*mdns.Resolver, string) mdns.LookupResult { return mdns.LookupResult{} },
+	)
+
 	now := time.Now()
 	eng.upsertDevice(scanner.RawDevice{IP: "203.0.113.9", MAC: "AA:BB:CC:DD:EE:FF"}, mdns.DeviceDetails{
 		Hostname:   "kept-name",
@@ -235,7 +232,7 @@ func TestTryStartPortScanRejectsDuplicate(t *testing.T) {
 	if !eng.tryBeginPortScan("00:11:22:33:44:77") {
 		t.Fatal("first begin should succeed")
 	}
-	started, err := eng.TryStartPortScan("00:11:22:33:44:77", "common")
+	started, err := eng.TryStartPortScan(context.Background(), "00:11:22:33:44:77", "common")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,5 +392,23 @@ func TestPatchDevicePersistsOverrides(t *testing.T) {
 	// Hostname stays sticky once sane (avoids garbage overwrites).
 	if got.Hostname != "MacBook" {
 		t.Fatalf("hostname unexpectedly changed: %q", got.Hostname)
+	}
+}
+
+func TestUpsertPrivateMACGenericHostnameDoesNotMerge(t *testing.T) {
+	eng := New(nil)
+	now := time.Now()
+
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.100", MAC: "3A:45:DB:15:44:3D"}, mdns.DeviceDetails{
+		Hostname: "iPhone",
+	}, "Private / Randomized MAC", now, nil)
+
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.101", MAC: "3A:99:88:77:66:55"}, mdns.DeviceDetails{
+		Hostname: "iPhone",
+	}, "Private / Randomized MAC", now.Add(time.Second), nil)
+
+	devs := eng.GetDevices()
+	if len(devs) != 2 {
+		t.Fatalf("expected 2 distinct devices for generic hostname 'iPhone', got %d", len(devs))
 	}
 }

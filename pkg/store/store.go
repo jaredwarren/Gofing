@@ -106,6 +106,29 @@ func (s *Store) SaveDevice(d engine.Device) error {
 	})
 }
 
+// SaveDevices batch-upserts multiple devices in a single BoltDB transaction.
+func (s *Store) SaveDevices(devices []engine.Device) error {
+	if len(devices) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketDevices))
+		for _, d := range devices {
+			if d.ID == "" {
+				continue
+			}
+			payload, err := json.Marshal(d)
+			if err != nil {
+				return err
+			}
+			if err := b.Put([]byte(d.ID), payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // LoadDevices returns all persisted devices.
 func (s *Store) LoadDevices() ([]engine.Device, error) {
 	var devices []engine.Device

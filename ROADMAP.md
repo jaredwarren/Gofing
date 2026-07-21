@@ -51,17 +51,17 @@ Gofing runs as a single Go binary on macOS. It:
 
 | Package / area | What exists today |
 |---|---|
-| [`main.go`](main.go) | Flags (`-port`, `-interval`, `-open`), initial scan, background ticker, HTTP server |
-| [`pkg/engine`](pkg/engine) | In-memory `map[string]*Device` keyed by **IP**; SSE event emit |
-| [`pkg/scanner`](pkg/scanner) | Ping sweep + `arp -an` → `RawDevice` |
-| [`pkg/mdns`](pkg/mdns) | `dns-sd` browse + hostname/type fingerprinting |
-| [`pkg/oui`](pkg/oui) | Embedded Nmap OUI + `mac_cache.json` disk cache |
-| [`pkg/ports`](pkg/ports) | `ScanPorts` + `CommonPorts` — **not wired into engine/API** |
-| [`pkg/network`](pkg/network) | Active iface, gateway, SSID, computer name |
-| [`pkg/server`](pkg/server) | `/api/network`, `/api/devices`, `/api/scan`, `/api/events` (SSE) |
-| [`web/static`](web/static) | SPA table + **modal** device detail (no tabs, no persistence UI) |
+| [`main.go`](main.go) | Flags (`-port`, `-interval`, `-open`, `-data-dir`), initial scan, background ticker, HTTP server with graceful SIGINT/SIGTERM shutdown |
+| [`pkg/engine`](pkg/engine) | Persistent device inventory keyed by **stable MAC/ID**; private MAC reconciliation with generic name filtering; batch BoltDB sync; SSE events |
+| [`pkg/scanner`](pkg/scanner) | Parallel TCP/ICMP ping sweep + `arp -a` MAC & hostname extraction → `RawDevice` |
+| [`pkg/mdns`](pkg/mdns) | Background `dns-sd` browse + TXT model/type fingerprinting + ranked name source resolution |
+| [`pkg/oui`](pkg/oui) | Embedded 55k+ Nmap OUI + `oui_cache.json` disk cache under Application Support data dir |
+| [`pkg/ports`](pkg/ports) | `ScanPorts` (common) + `ScanPortsRange` (deep) — **fully wired into engine, REST API, & SSE** |
+| [`pkg/network`](pkg/network) | Active interface, IP, subnet CIDR, gateway IP, SSID, computer name |
+| [`pkg/server`](pkg/server) | `/api/network`, `/api/devices`, `/api/devices/{id}`, `/api/devices/{id}/portscan`, `/api/devices/{id}/history`, `/api/devices/{id}/resolve-name`, `/api/events` (SSE) |
+| [`web/static`](web/static) | Responsive SPA table + **tabbed right-side inspection drawer** (Overview, Ports, History, Tools, Security) |
 
-**Gaps vs Fing:** no persistence/history, IP-keyed identity, no presence monitor/alerts, unused port scan, no WOL/ping/traceroute/speed test, no security score, no export, no launchd install.
+**Gaps vs Fing:** no presence monitor/alerts (Phase 3), no WOL/ping/traceroute/speed test (Phase 4), no security score (Phase 5), no export (Phase 6), no launchd install (Phase 8).
 
 ---
 

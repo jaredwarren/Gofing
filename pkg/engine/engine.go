@@ -59,16 +59,18 @@ const offlineMissThreshold = 3
 
 // Engine coordinates scanning, fingerprinting, and state management.
 type Engine struct {
-	mu              sync.RWMutex
-	devices         map[string]*Device // keyed by stable Device.ID
-	missCount       map[string]int     // consecutive scan misses per device ID
-	portScanMu      sync.Mutex
+	mu               sync.RWMutex
+	devices          map[string]*Device // keyed by stable Device.ID
+	missCount        map[string]int     // consecutive scan misses per device ID
+	portScanMu       sync.Mutex
 	portScanInflight map[string]bool
-	netScanner      *scanner.Scanner
-	mdnsResolver    *mdns.Resolver
-	listeners       []EventFunc
-	isScanning      bool
-	persist         Persistence
+	netScanner       *scanner.Scanner
+	mdnsResolver     *mdns.Resolver
+	listeners        []EventFunc
+	isScanning       bool
+	persist          Persistence
+	warmHostFn       func(ip string)
+	deepLookupFn     func(r *mdns.Resolver, ip string) mdns.LookupResult
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -80,6 +82,10 @@ func New(persist Persistence) *Engine {
 		netScanner:       scanner.New(),
 		mdnsResolver:     mdns.New(),
 		persist:          persist,
+		warmHostFn:       warmHost,
+		deepLookupFn: func(r *mdns.Resolver, ip string) mdns.LookupResult {
+			return r.LookupHostnameDeep(ip)
+		},
 	}
 	e.loadFromStore()
 	return e
@@ -132,7 +138,18 @@ func (e *Engine) persistDevice(d Device) {
 	if e.persist == nil {
 		return
 	}
-	_ = e.persist.SaveDevice(d)
+	if err := e.persist.SaveDevice(d); err != nil {
+		log.Printf("Failed to save device %s: %v", d.ID, err)
+	}
+}
+
+func (e *Engine) persistDevices(devices []Device) {
+	if e.persist == nil || len(devices) == 0 {
+		return
+	}
+	if err := e.persist.SaveDevices(devices); err != nil {
+		log.Printf("Failed to save devices: %v", err)
+	}
 }
 
 func (e *Engine) recordEvent(typ, deviceID, message string) {
@@ -223,7 +240,9 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 	}
 
 	// Nudge the host so macOS may refresh ARP / mDNS cache entries.
-	warmHostFn(dev.IP)
+	if e.warmHostFn != nil {
+		e.warmHostFn(dev.IP)
+	}
 
 	var candidates []mdns.NameCandidate
 	bestName, bestSrc := "", mdns.NameSourceNone
@@ -241,7 +260,10 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 		consider(arpName, mdns.NameSourceARP)
 	}
 
-	deep := deepLookupFn(e.mdnsResolver, dev.IP)
+	var deep mdns.LookupResult
+	if e.deepLookupFn != nil {
+		deep = e.deepLookupFn(e.mdnsResolver, dev.IP)
+	}
 	for _, c := range deep.Candidates {
 		consider(c.Hostname, c.Source)
 	}
@@ -295,8 +317,13 @@ func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
 	if dev.IP == "" {
 		return mdns.LookupResult{}, nil
 	}
-	warmHostFn(dev.IP)
-	res := deepLookupFn(e.mdnsResolver, dev.IP)
+	if e.warmHostFn != nil {
+		e.warmHostFn(dev.IP)
+	}
+	var res mdns.LookupResult
+	if e.deepLookupFn != nil {
+		res = e.deepLookupFn(e.mdnsResolver, dev.IP)
+	}
 	if arpName := e.netScanner.ARPHostname(dev.IP); arpName != "" {
 		if h := mdns.SanitizeHostname(arpName); h != "" {
 			res.Candidates = append([]mdns.NameCandidate{{Hostname: h, Source: mdns.NameSourceARP}}, res.Candidates...)
@@ -306,20 +333,20 @@ func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
 	return res, nil
 }
 
+// SetTestHooks configures custom network lookup functions for unit testing.
+func (e *Engine) SetTestHooks(warmHost func(ip string), deepLookup func(r *mdns.Resolver, ip string) mdns.LookupResult) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.warmHostFn = warmHost
+	e.deepLookupFn = deepLookup
+}
+
 func warmHost(ip string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "500", ip)
 	_ = cmd.Run()
 }
-
-// Test hooks — overridden in unit tests to avoid real network I/O.
-var (
-	warmHostFn = warmHost
-	deepLookupFn = func(r *mdns.Resolver, ip string) mdns.LookupResult {
-		return r.LookupHostnameDeep(ip)
-	}
-)
 
 func (e *Engine) backgroundNameResolve(id string) {
 	select {
@@ -356,7 +383,10 @@ func (e *Engine) endPortScan(id string) {
 
 // TryStartPortScan validates and launches an async port scan. started=false means
 // one is already in flight for this device (not an error).
-func (e *Engine) TryStartPortScan(id, mode string) (started bool, err error) {
+func (e *Engine) TryStartPortScan(ctx context.Context, id, mode string) (started bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if _, ok := e.GetDevice(id); !ok {
 		return false, fmt.Errorf("device not found")
 	}
@@ -372,7 +402,7 @@ func (e *Engine) TryStartPortScan(id, mode string) (started bool, err error) {
 	}
 	go func() {
 		defer e.endPortScan(id)
-		if _, err := e.runPortScan(id, mode); err != nil {
+		if _, err := e.runPortScan(ctx, id, mode); err != nil {
 			log.Printf("port scan %s (%s): %v", id, mode, err)
 			e.emitEvent("portscan_error", map[string]interface{}{
 				"id":    id,
@@ -386,7 +416,10 @@ func (e *Engine) TryStartPortScan(id, mode string) (started bool, err error) {
 
 // ScanDevicePorts probes a device for open ports and persists the result.
 // mode is "common" (default) or "deep" (ports 1–1024, capped).
-func (e *Engine) ScanDevicePorts(id, mode string) ([]ports.ServicePort, error) {
+func (e *Engine) ScanDevicePorts(ctx context.Context, id, mode string) ([]ports.ServicePort, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		mode = "common"
@@ -398,10 +431,10 @@ func (e *Engine) ScanDevicePorts(id, mode string) ([]ports.ServicePort, error) {
 		return nil, ErrPortScanInProgress
 	}
 	defer e.endPortScan(id)
-	return e.runPortScan(id, mode)
+	return e.runPortScan(ctx, id, mode)
 }
 
-func (e *Engine) runPortScan(id, mode string) ([]ports.ServicePort, error) {
+func (e *Engine) runPortScan(ctx context.Context, id, mode string) ([]ports.ServicePort, error) {
 	dev, ok := e.GetDevice(id)
 	if !ok {
 		return nil, fmt.Errorf("device not found")
@@ -413,9 +446,9 @@ func (e *Engine) runPortScan(id, mode string) ([]ports.ServicePort, error) {
 	var open []ports.ServicePort
 	switch mode {
 	case "deep":
-		open = ports.ScanPortsRange(dev.IP, ports.DefaultDeepStart, ports.DefaultDeepEnd, 128, 80*time.Millisecond)
+		open = ports.ScanPortsRange(ctx, dev.IP, ports.DefaultDeepStart, ports.DefaultDeepEnd, 128, 80*time.Millisecond)
 	default:
-		open = ports.ScanPorts(dev.IP)
+		open = ports.ScanPorts(ctx, dev.IP)
 	}
 
 	e.mu.Lock()
@@ -461,7 +494,10 @@ func (e *Engine) IsScanning() bool {
 }
 
 // PerformScan executes a complete network discovery pass.
-func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
+func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Device, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e.mu.Lock()
 	if e.isScanning {
 		e.mu.Unlock()
@@ -481,7 +517,7 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 		"ssid":   netInfo.SSID,
 	})
 
-	rawDevices, err := e.netScanner.PerformScan(netInfo.SubnetCIDR, func(current, total int) {
+	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, func(current, total int) {
 		e.emitEvent("scan_progress", map[string]int{
 			"scanned": current,
 			"total":   total,
@@ -617,7 +653,9 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		out := *newDev
 		e.mu.Unlock()
 
-		e.persistDevice(out)
+		if !e.isScanning {
+			e.persistDevice(out)
+		}
 		e.recordEvent("found", out.ID, fmt.Sprintf("Discovered %s (%s)", out.DisplayName(), out.IP))
 		e.emitEvent("device_found", &out)
 		if out.Hostname == "" {
@@ -685,7 +723,9 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	out := *existing
 	e.mu.Unlock()
 
-	e.persistDevice(out)
+	if !e.isScanning {
+		e.persistDevice(out)
+	}
 	if cameOnline {
 		e.recordEvent("online", out.ID, fmt.Sprintf("%s is online", out.DisplayName()))
 		if out.Hostname == "" {
@@ -728,17 +768,30 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 
 	if normMAC != "" && IsPrivateMAC(normMAC) && hostname != "" {
 		want := strings.ToLower(strings.TrimSpace(hostname))
-		for _, d := range e.devices {
-			if d.Hostname == "" {
-				continue
-			}
-			if strings.ToLower(strings.TrimSpace(d.Hostname)) == want {
-				return d, true, d.MAC
+		if !isGenericHostname(want) {
+			for _, d := range e.devices {
+				if d.Hostname == "" {
+					continue
+				}
+				if strings.ToLower(strings.TrimSpace(d.Hostname)) == want {
+					return d, true, d.MAC
+				}
 			}
 		}
 	}
 
 	return nil, false, ""
+}
+
+func isGenericHostname(hostname string) bool {
+	switch strings.ToLower(strings.TrimSpace(hostname)) {
+	case "iphone", "ipad", "android", "dhcp", "workstation", "generic", "device",
+		"laptop", "computer", "pc", "macbook", "network", "unknown", "host", "local",
+		"android-dhcp", "kindle", "galaxy", "home", "lan", "gateway", "router":
+		return true
+	default:
+		return false
+	}
 }
 
 func appendUniqueMAC(list []string, mac string) []string {

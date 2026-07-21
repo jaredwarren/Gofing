@@ -1,6 +1,7 @@
 package ports
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -23,7 +24,7 @@ func TestDedupSort(t *testing.T) {
 
 func TestScanPortsRangeCap(t *testing.T) {
 	// Request a huge range; implementation must cap at MaxDeepPorts probes.
-	got := ScanPortsRange("127.0.0.1", 1, 5000, 128, 5*time.Millisecond)
+	got := ScanPortsRange(context.Background(), "127.0.0.1", 1, 5000, 128, 5*time.Millisecond)
 	if len(got) > MaxDeepPorts {
 		t.Fatalf("got %d open ports, over cap", len(got))
 	}

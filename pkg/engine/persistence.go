@@ -18,6 +18,7 @@ type Event struct {
 // Defined here so engine does not import store (store already imports engine).
 type Persistence interface {
 	SaveDevice(d Device) error
+	SaveDevices(devices []Device) error
 	LoadDevices() ([]Device, error)
 	AppendEvent(ev Event) error
 	ListEvents(deviceID string, limit int) ([]Event, error)

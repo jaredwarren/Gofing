@@ -1,6 +1,7 @@
 package ports
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sort"
@@ -80,13 +81,13 @@ func PortName(port int) string {
 }
 
 // ScanPorts probes the target IP for open common ports in parallel.
-func ScanPorts(ip string) []ServicePort {
-	return scanPortList(ip, CommonPorts, 64, 80*time.Millisecond)
+func ScanPorts(ctx context.Context, ip string) []ServicePort {
+	return scanPortList(ctx, ip, CommonPorts, 64, 80*time.Millisecond)
 }
 
 // ScanPortsRange probes TCP ports in [start, end] inclusive.
 // Range size is capped at MaxDeepPorts (truncated from start if needed).
-func ScanPortsRange(ip string, start, end int, concurrency int, timeout time.Duration) []ServicePort {
+func ScanPortsRange(ctx context.Context, ip string, start, end int, concurrency int, timeout time.Duration) []ServicePort {
 	if start < 1 {
 		start = 1
 	}
@@ -116,12 +117,15 @@ func ScanPortsRange(ip string, start, end int, concurrency int, timeout time.Dur
 	for p := start; p <= end; p++ {
 		list = append(list, ServicePort{Port: p, Name: PortName(p)})
 	}
-	return scanPortList(ip, list, concurrency, timeout)
+	return scanPortList(ctx, ip, list, concurrency, timeout)
 }
 
-func scanPortList(ip string, list []ServicePort, concurrency int, timeout time.Duration) []ServicePort {
+func scanPortList(ctx context.Context, ip string, list []ServicePort, concurrency int, timeout time.Duration) []ServicePort {
 	if ip == "" || len(list) == 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if concurrency < 1 {
 		concurrency = 32
@@ -133,13 +137,25 @@ func scanPortList(ip string, list []ServicePort, concurrency int, timeout time.D
 	var wg sync.WaitGroup
 
 	for _, p := range list {
+		select {
+		case <-ctx.Done():
+			break
+		default:
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(sp ServicePort) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			addr := net.JoinHostPort(ip, fmt.Sprintf("%d", sp.Port))
-			conn, err := net.DialTimeout("tcp", addr, timeout)
+			var d net.Dialer
+			d.Timeout = timeout
+			conn, err := d.DialContext(ctx, "tcp", addr)
 			if err == nil {
 				_ = conn.Close()
 				mu.Lock()

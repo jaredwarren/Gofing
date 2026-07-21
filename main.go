@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/engine"
@@ -46,12 +50,15 @@ func main() {
 	log.Printf("🌐 Active Network Interface: %s (IP: %s, Subnet: %s, Gateway: %s, SSID: %s)",
 		netInfo.InterfaceName, netInfo.IP, netInfo.SubnetCIDR, netInfo.GatewayIP, netInfo.SSID)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	devEngine := engine.New(db)
 	log.Printf("📂 Loaded %d known devices from store", len(devEngine.GetDevices()))
 
 	go func() {
 		log.Println("🔍 Performing initial subnet scan...")
-		devices, err := devEngine.PerformScan(netInfo)
+		devices, err := devEngine.PerformScan(ctx, netInfo)
 		if err != nil {
 			log.Printf("⚠️ Initial scan error: %v", err)
 		} else {
@@ -63,9 +70,14 @@ func main() {
 		ticker := time.NewTicker(*intervalFlag)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			if currentInfo, err := network.GetActiveNetworkInfo(); err == nil {
-				_, _ = devEngine.PerformScan(currentInfo)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if currentInfo, err := network.GetActiveNetworkInfo(); err == nil {
+					_, _ = devEngine.PerformScan(ctx, currentInfo)
+				}
 			}
 		}
 	}()
@@ -79,15 +91,36 @@ func main() {
 	addr := fmt.Sprintf(":%d", *portFlag)
 	url := fmt.Sprintf("http://localhost:%d", *portFlag)
 
-	log.Printf("🚀 Gofing Web Interface running at %s", url)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: httpServer.Handler(),
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("🚀 Gofing Web Interface running at %s", url)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("❌ Server error: %v", err)
+		}
+	}()
 
 	if *openBrowserFlag {
 		go openBrowser(url)
 	}
 
-	if err := http.ListenAndServe(addr, httpServer.Handler()); err != nil {
-		log.Fatalf("❌ Server error: %v", err)
+	<-stop
+	log.Println("🛑 Shutting down Gofing service gracefully...")
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("⚠️ HTTP shutdown error: %v", err)
 	}
+	log.Println("👋 Store closed. Shutdown complete.")
 }
 
 func openBrowser(url string) {

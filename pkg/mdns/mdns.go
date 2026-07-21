@@ -117,32 +117,11 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 	}
 
 	// Priority 3: Reverse DNS / dns-sd PTR (moderate timeout during scans)
+	// Priority 3: Reverse DNS / dns-sd PTR (quick timeout during scans)
 	if hostname == "" {
 		if h, src := r.LookupHostnameQuick(ip); h != "" {
 			hostname = h
 			nameSource = src
-		}
-	}
-
-	// Priority 4: Google Cast / Nest API
-	if ccName := SanitizeHostname(queryChromecastName(ip)); ccName != "" {
-		services = append(services, "Google Cast")
-		if hostname == "" {
-			hostname = ccName
-			nameSource = NameSourceCast
-		}
-		if detectedType == "" {
-			detectedType = "Smart TV"
-			detectedIcon = "tv"
-			detectedModel = "Google Nest / Chromecast"
-		}
-	}
-
-	// Priority 5: HTTP Title Grabber
-	if hostname == "" {
-		if title := SanitizeHostname(fetchHTTPTitle(ip)); title != "" {
-			hostname = title
-			nameSource = NameSourceHTTP
 		}
 	}
 

@@ -37,19 +37,25 @@ func New() *Scanner {
 // PerformScan executes a ping sweep across the subnet, then uses the ARP table
 // only to enrich MAC addresses. A host is considered present only if it
 // responded to a reachability probe — stale ARP cache entries alone are not
+// PerformScan executes a ping sweep across the subnet, then uses the ARP table
+// only to enrich MAC addresses. A host is considered present only if it
+// responded to a reachability probe — stale ARP cache entries alone are not
 // enough (macOS retains ARP rows for minutes after a device disconnects).
-func (s *Scanner) PerformScan(subnetCIDR string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
+func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ips, err := expandCIDR(subnetCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to expand CIDR: %w", err)
 	}
 
 	// 1. Fast Ping Sweep across subnet using parallel worker pool
-	pingResults := s.pingSweep(ips, progressCb)
+	pingResults := s.pingSweep(ctx, ips, progressCb)
 
 	// 2. Parse macOS ARP table for MAC enrichment only
 	arpByIP := make(map[string]RawDevice)
-	arpDevices, err := s.parsemacOSARPTable()
+	arpDevices, err := s.parsemacOSARPTable(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ARP table: %w", err)
 	}
@@ -81,14 +87,14 @@ func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevi
 	return result
 }
 
-func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) map[string]float64 {
+func (s *Scanner) pingSweep(ctx context.Context, ips []string, progressCb func(scanned, total int)) map[string]float64 {
 	results := make(map[string]float64)
 	var mu sync.Mutex
 
 	total := len(ips)
 	var processed int32
 
-	// Moderate concurrency — 128 parallel probes floods Wi‑Fi and causes false misses.
+	// Moderate concurrency — 48 parallel probes to avoid Wi-Fi saturation.
 	concurrency := 48
 	ipChan := make(chan string, total)
 	for _, ip := range ips {
@@ -102,7 +108,12 @@ func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) m
 		go func() {
 			defer wg.Done()
 			for ip := range ipChan {
-				lat, ok := pingIPFast(ip)
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				lat, ok := pingIPFast(ctx, ip)
 
 				curr := atomic.AddInt32(&processed, 1)
 
@@ -123,13 +134,15 @@ func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) m
 	return results
 }
 
-func pingIPFast(ip string) (float64, bool) {
+func pingIPFast(ctx context.Context, ip string) (float64, bool) {
 	// TCP probes first — moderately patient to avoid Wi‑Fi false negatives.
 	commonPorts := []string{"80", "443", "22", "445", "53", "8080", "548", "5000"}
 	start := time.Now()
 
 	for _, port := range commonPorts {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), 100*time.Millisecond)
+		var d net.Dialer
+		d.Timeout = 100 * time.Millisecond
+		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 		if err == nil {
 			conn.Close()
 			lat := float64(time.Since(start).Microseconds()) / 1000.0
@@ -138,14 +151,14 @@ func pingIPFast(ip string) (float64, bool) {
 	}
 
 	// ICMP with one retry. macOS ping -W is milliseconds to wait for a reply.
-	if lat, ok := pingOnce(ip, 400*time.Millisecond); ok {
+	if lat, ok := pingOnce(ctx, ip, 400*time.Millisecond); ok {
 		return lat, true
 	}
-	return pingOnce(ip, 500*time.Millisecond)
+	return pingOnce(ctx, ip, 500*time.Millisecond)
 }
 
-func pingOnce(ip string, timeout time.Duration) (float64, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+200*time.Millisecond)
+func pingOnce(parentCtx context.Context, ip string, timeout time.Duration) (float64, bool) {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout+200*time.Millisecond)
 	defer cancel()
 
 	waitMs := int(timeout / time.Millisecond)
@@ -190,9 +203,12 @@ func parsePingLatency(output string) float64 {
 // Use `arp -a` (not -an) so Bonjour names are present when macOS knows them.
 var arpLineRe = regexp.MustCompile(`^(\S+)\s+\(([\d.]+)\)\s+at\s+([0-9a-fA-F:]+)\s+on\s+(\w+)`)
 
-func (s *Scanner) parsemacOSARPTable() ([]RawDevice, error) {
+func (s *Scanner) parsemacOSARPTable(ctx context.Context) ([]RawDevice, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// `-a` (not `-n`) includes mDNS/Bonjour hostnames when cached.
-	cmd := exec.Command("arp", "-a")
+	cmd := exec.CommandContext(ctx, "arp", "-a")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
@@ -205,7 +221,7 @@ func (s *Scanner) parsemacOSARPTable() ([]RawDevice, error) {
 
 // ARPHostname returns the Bonjour/mDNS name for ip from `arp -a`, if present.
 func (s *Scanner) ARPHostname(ip string) string {
-	devices, err := s.parsemacOSARPTable()
+	devices, err := s.parsemacOSARPTable(context.Background())
 	if err != nil {
 		return ""
 	}
