@@ -1,8 +1,21 @@
 package oui
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "gofing-oui-test-*")
+	if err != nil {
+		panic(err)
+	}
+	dataDirOverride = dir
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func TestLookupVendor(t *testing.T) {
 	tests := []struct {
@@ -37,5 +50,23 @@ func TestIsRandomizedMAC(t *testing.T) {
 	}
 	if isRandomizedMAC("001C42112233") {
 		t.Errorf("expected 00:1C:42... NOT to be randomized")
+	}
+}
+
+func TestCacheWritesToDataDirNotCwd(t *testing.T) {
+	_ = LookupVendor("3A:45:DB:15:44:3D")
+
+	path := cachePath()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected data-dir cache at %s: %v", path, err)
+	}
+	if filepath.Dir(path) != dataDirOverride {
+		t.Fatalf("cache not under override dir: %s", path)
+	}
+
+	// Ensure saveDiskCache did not write oui_cache.json into the process cwd.
+	cwdOui := filepath.Join(".", cacheFileName)
+	if _, err := os.Stat(cwdOui); err == nil {
+		t.Fatalf("unexpected cwd cache file %s", cwdOui)
 	}
 }

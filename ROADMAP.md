@@ -179,7 +179,7 @@ type Device struct {
 
 ### Task 0.1 — Add `pkg/store` (BoltDB)
 
-- [ ] **Goal:** Persistent key/value store for devices, events, and settings.
+- [x] **Goal:** Persistent key/value store for devices, events, and settings.
 - **Create:**
   - [`pkg/store/store.go`](pkg/store/store.go)
   - [`pkg/store/store_test.go`](pkg/store/store_test.go)
@@ -227,7 +227,7 @@ type Device struct {
 
 ### Task 0.2 — Stable device identity + private-MAC reconciliation
 
-- [ ] **Goal:** Key devices by MAC (not IP); merge private-MAC rotations via hostname.
+- [x] **Goal:** Key devices by MAC (not IP); merge private-MAC rotations via hostname.
 - **Edit:**
   - [`pkg/engine/engine.go`](pkg/engine/engine.go)
   - [`pkg/engine/engine_test.go`](pkg/engine/engine_test.go) (add focused unit tests)
@@ -252,7 +252,7 @@ type Device struct {
 
 ### Task 0.3 — Migrate OUI cache off `mac_cache.json`
 
-- [ ] **Goal:** Stop writing `mac_cache.json` in the cwd; keep OUI lookups working.
+- [x] **Goal:** Stop writing `mac_cache.json` in the cwd; keep OUI lookups working.
 - **Edit:** [`pkg/oui/oui.go`](pkg/oui/oui.go), [`pkg/oui/oui_test.go`](pkg/oui/oui_test.go)
 - **Approach:** Keep an in-memory + optional BoltDB bucket **or** a cache file under the Gofing data dir (`~/Library/Application Support/Gofing/oui_cache.json`). Prefer data-dir JSON file if avoiding store↔oui circular imports; document the path. Remove reliance on cwd `mac_cache.json`. Add cwd file to `.gitignore` remains fine.
 - **Acceptance:** Lookup still returns vendors; no new `mac_cache.json` created in repo root during `go test` / short run; tests pass.
@@ -260,7 +260,7 @@ type Device struct {
 
 ### Task 0.4 — README stub + quality gate
 
-- [ ] **Goal:** Document how to build/run and that this roadmap is the source of truth.
+- [x] **Goal:** Document how to build/run and that this roadmap is the source of truth.
 - **Create:** [`README.md`](README.md)
 - **Contents (brief):** what Gofing is, macOS-only, `make build` / `make run` / `make test`, link to this ROADMAP, data dir location.
 - **Acceptance:** README exists; `go test ./... && go build -o gofing .` documented and green on a clean tree.

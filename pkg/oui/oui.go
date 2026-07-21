@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,10 @@ import (
 //go:embed nmap-mac-prefixes
 var rawPrefixes string
 
-const cacheFileName = "mac_cache.json"
+// New writes go to ~/Library/Application Support/Gofing/oui_cache.json.
+// legacyCacheFileName is only read as a one-time migration fallback from cwd.
+const cacheFileName = "oui_cache.json"
+const legacyCacheFileName = "mac_cache.json"
 
 type macLookupResponse struct {
 	Success   bool   `json:"success"`
@@ -30,6 +34,9 @@ var (
 	cacheMu    sync.RWMutex
 	initOnce   sync.Once
 	httpClient = &http.Client{Timeout: 1500 * time.Millisecond}
+
+	// dataDirOverride is used by tests to avoid writing into the real home dir.
+	dataDirOverride string
 )
 
 func initMap() {
@@ -57,21 +64,53 @@ func initMap() {
 	loadDiskCache()
 }
 
+// dataDir mirrors store.DefaultDataDir without importing store (avoids
+// store → engine → oui → store cycles). Path: ~/Library/Application Support/Gofing
+func dataDir() string {
+	if dataDirOverride != "" {
+		return dataDirOverride
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".", "GofingData")
+	}
+	return filepath.Join(home, "Library", "Application Support", "Gofing")
+}
+
+func cachePath() string {
+	return filepath.Join(dataDir(), cacheFileName)
+}
+
 func loadDiskCache() {
-	data, err := os.ReadFile(cacheFileName)
-	if err == nil {
+	// Prefer data-dir cache.
+	if data, err := os.ReadFile(cachePath()); err == nil {
 		var loaded map[string]string
 		if err := json.Unmarshal(data, &loaded); err == nil {
 			diskCache = loaded
+			return
+		}
+	}
+
+	// One-time migration from legacy cwd mac_cache.json.
+	if data, err := os.ReadFile(legacyCacheFileName); err == nil {
+		var loaded map[string]string
+		if err := json.Unmarshal(data, &loaded); err == nil {
+			diskCache = loaded
+			saveDiskCache()
 		}
 	}
 }
 
 func saveDiskCache() {
-	data, err := json.MarshalIndent(diskCache, "", "  ")
-	if err == nil {
-		_ = os.WriteFile(cacheFileName, data, 0644)
+	dir := dataDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
 	}
+	data, err := json.MarshalIndent(diskCache, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(cachePath(), data, 0o644)
 }
 
 // LookupVendor checks embedded DB -> disk cache -> maclookup.app API.

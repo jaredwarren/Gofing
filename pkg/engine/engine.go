@@ -14,18 +14,24 @@ import (
 
 // Device represents an enriched network device.
 type Device struct {
-	IP         string    `json:"ip"`
-	MAC        string    `json:"mac"`
-	Vendor     string    `json:"vendor"`
-	Hostname   string    `json:"hostname"`
-	DeviceType string    `json:"device_type"`
-	Icon       string    `json:"icon"`
-	Model      string    `json:"model"`
-	LatencyMs  float64   `json:"latency_ms"`
-	IsOnline   bool      `json:"is_online"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	Services   []string  `json:"services"`
+	ID                 string    `json:"id"`
+	IP                 string    `json:"ip"`
+	MAC                string    `json:"mac"`
+	PreviousMACs       []string  `json:"previous_macs,omitempty"`
+	Vendor             string    `json:"vendor"`
+	Hostname           string    `json:"hostname"`
+	CustomName         string    `json:"custom_name,omitempty"`
+	Note               string    `json:"note,omitempty"`
+	DeviceType         string    `json:"device_type"`
+	DeviceTypeOverride string    `json:"device_type_override,omitempty"`
+	Icon               string    `json:"icon"`
+	Model              string    `json:"model"`
+	LatencyMs          float64   `json:"latency_ms"`
+	IsOnline           bool      `json:"is_online"`
+	IsPrivateMAC       bool      `json:"is_private_mac"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	Services           []string  `json:"services"`
 }
 
 // EventFunc is called when a device is discovered or updated.
@@ -34,7 +40,7 @@ type EventFunc func(eventType string, data interface{})
 // Engine coordinates scanning, fingerprinting, and state management.
 type Engine struct {
 	mu           sync.RWMutex
-	devices      map[string]*Device
+	devices      map[string]*Device // keyed by stable Device.ID
 	netScanner   *scanner.Scanner
 	mdnsResolver *mdns.Resolver
 	listeners    []EventFunc
@@ -113,7 +119,6 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 		"ssid":   netInfo.SSID,
 	})
 
-	// 1. Run scanner
 	rawDevices, err := e.netScanner.PerformScan(netInfo.SubnetCIDR, func(current, total int) {
 		e.emitEvent("scan_progress", map[string]int{
 			"scanned": current,
@@ -127,13 +132,11 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 
 	now := time.Now()
 	e.mu.Lock()
-	// Mark existing devices offline
 	for _, dev := range e.devices {
 		dev.IsOnline = false
 	}
 	e.mu.Unlock()
 
-	// 2. Resolve raw devices concurrently in parallel
 	var wg sync.WaitGroup
 	deviceChan := make(chan scanner.RawDevice, len(rawDevices))
 	for _, raw := range rawDevices {
@@ -147,8 +150,8 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 		go func() {
 			defer wg.Done()
 			for raw := range deviceChan {
-				isGateway := (raw.IP == netInfo.GatewayIP)
-				isHost := (raw.IP == netInfo.IP || (raw.MAC != "" && strings.EqualFold(raw.MAC, netInfo.MAC)))
+				isGateway := raw.IP == netInfo.GatewayIP
+				isHost := raw.IP == netInfo.IP || (raw.MAC != "" && strings.EqualFold(raw.MAC, netInfo.MAC))
 				macVendor := oui.LookupVendor(raw.MAC)
 
 				hostCompName := ""
@@ -157,47 +160,7 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 				}
 
 				details := e.mdnsResolver.ResolveDevice(raw.IP, raw.MAC, macVendor, isGateway, hostCompName)
-
-				e.mu.Lock()
-				existing, found := e.devices[raw.IP]
-				if !found {
-					newDev := &Device{
-						IP:         raw.IP,
-						MAC:        raw.MAC,
-						Vendor:     macVendor,
-						Hostname:   details.Hostname,
-						DeviceType: details.DeviceType,
-						Icon:       details.Icon,
-						Model:      details.Model,
-						Services:   details.Services,
-						LatencyMs:  raw.LatencyMs,
-						IsOnline:   true,
-						FirstSeen:  now,
-						LastSeen:   now,
-					}
-					e.devices[raw.IP] = newDev
-					e.mu.Unlock()
-					e.emitEvent("device_found", newDev)
-				} else {
-					existing.IsOnline = true
-					existing.LastSeen = now
-					existing.LatencyMs = raw.LatencyMs
-					if raw.MAC != "" {
-						existing.MAC = raw.MAC
-						existing.Vendor = macVendor
-					}
-					if details.Hostname != "" {
-						existing.Hostname = details.Hostname
-					}
-					if details.DeviceType != "" {
-						existing.DeviceType = details.DeviceType
-						existing.Icon = details.Icon
-						existing.Model = details.Model
-					}
-					existing.Services = details.Services
-					e.mu.Unlock()
-					e.emitEvent("device_updated", existing)
-				}
+				e.upsertDevice(raw, details, macVendor, now)
 			}
 		}()
 	}
@@ -211,6 +174,143 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	})
 
 	return finalList, nil
+}
+
+// upsertDevice merges a scanned host into inventory using stable identity rules.
+// Caller must NOT hold e.mu.
+func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time) {
+	normMAC := NormalizeMAC(raw.MAC)
+	private := IsPrivateMAC(normMAC)
+
+	e.mu.Lock()
+
+	existing, found, previousMAC := e.findDeviceLocked(normMAC, raw.IP, details.Hostname)
+
+	if !found {
+		id := DeviceID(normMAC, raw.IP)
+		newDev := &Device{
+			ID:           id,
+			IP:           raw.IP,
+			MAC:          normMAC,
+			Vendor:       macVendor,
+			Hostname:     details.Hostname,
+			DeviceType:   details.DeviceType,
+			Icon:         details.Icon,
+			Model:        details.Model,
+			Services:     details.Services,
+			LatencyMs:    raw.LatencyMs,
+			IsOnline:     true,
+			IsPrivateMAC: private,
+			FirstSeen:    now,
+			LastSeen:     now,
+		}
+		e.devices[id] = newDev
+		e.mu.Unlock()
+		e.emitEvent("device_found", newDev)
+		return
+	}
+
+	// IP change for known MAC (or hostname merge): keep ID and FirstSeen.
+	existing.IsOnline = true
+	existing.LastSeen = now
+	existing.LatencyMs = raw.LatencyMs
+	existing.IP = raw.IP
+
+	if normMAC != "" {
+		if existing.MAC != "" && existing.MAC != normMAC {
+			if previousMAC == "" {
+				previousMAC = existing.MAC
+			}
+			existing.PreviousMACs = appendUniqueMAC(existing.PreviousMACs, previousMAC)
+		}
+		existing.MAC = normMAC
+		existing.IsPrivateMAC = private
+		existing.Vendor = macVendor
+
+		// Promote ip:-based identity to MAC identity only. MAC rotations keep the original ID.
+		if strings.HasPrefix(existing.ID, "ip:") {
+			newID := DeviceID(normMAC, raw.IP)
+			if newID != "" && newID != existing.ID {
+				delete(e.devices, existing.ID)
+				existing.ID = newID
+				e.devices[newID] = existing
+			}
+		}
+	}
+
+	if details.Hostname != "" {
+		existing.Hostname = details.Hostname
+	}
+	if details.DeviceType != "" {
+		existing.DeviceType = details.DeviceType
+		existing.Icon = details.Icon
+		existing.Model = details.Model
+	}
+	existing.Services = details.Services
+
+	e.mu.Unlock()
+	e.emitEvent("device_updated", existing)
+}
+
+// findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.
+// Must be called with e.mu held.
+func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, found bool, previousMAC string) {
+	// 1. MAC match
+	if normMAC != "" {
+		if d, ok := e.devices[DeviceID(normMAC, "")]; ok {
+			return d, true, ""
+		}
+		// Also scan in case ID was ip:-based but MAC field matches.
+		for _, d := range e.devices {
+			if d.MAC != "" && d.MAC == normMAC {
+				return d, true, ""
+			}
+			for _, prev := range d.PreviousMACs {
+				if prev == normMAC {
+					return d, true, ""
+				}
+			}
+		}
+	}
+
+	// 2. IP fallback key
+	if ip != "" {
+		if d, ok := e.devices[DeviceID("", ip)]; ok {
+			return d, true, ""
+		}
+		for _, d := range e.devices {
+			if d.IP == ip {
+				return d, true, ""
+			}
+		}
+	}
+
+	// 3. Private MAC rotation: merge on exact hostname (case-insensitive).
+	if normMAC != "" && IsPrivateMAC(normMAC) && hostname != "" {
+		want := strings.ToLower(strings.TrimSpace(hostname))
+		for _, d := range e.devices {
+			if d.Hostname == "" {
+				continue
+			}
+			if strings.ToLower(strings.TrimSpace(d.Hostname)) == want {
+				return d, true, d.MAC
+			}
+		}
+	}
+
+	return nil, false, ""
+}
+
+func appendUniqueMAC(list []string, mac string) []string {
+	if mac == "" {
+		return list
+	}
+	for _, m := range list {
+		if m == mac {
+			return list
+		}
+	}
+	return append(list, mac)
 }
 
 func compareIPs(ip1, ip2 string) bool {
