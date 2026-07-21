@@ -18,7 +18,7 @@ func TestIPSorting(t *testing.T) {
 }
 
 func TestEngineEvents(t *testing.T) {
-	eng := New()
+	eng := New(nil)
 	eventCount := 0
 
 	eng.RegisterEventListener(func(eventType string, data interface{}) {
@@ -60,7 +60,6 @@ func TestDeviceID(t *testing.T) {
 }
 
 func TestIsPrivateMAC(t *testing.T) {
-	// U/L bit set: second least-significant bit of first octet
 	if !IsPrivateMAC("3A:45:DB:15:44:3D") {
 		t.Error("expected 3A:... private")
 	}
@@ -76,16 +75,16 @@ func TestIsPrivateMAC(t *testing.T) {
 }
 
 func TestUpsertStableMACKeepsIDOnIPChange(t *testing.T) {
-	eng := New()
+	eng := New(nil)
 	now := time.Now()
 
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.10", MAC: "00:1C:42:11:22:33"}, mdns.DeviceDetails{
 		Hostname: "MacBook",
-	}, "Apple", now)
+	}, "Apple", now, nil)
 
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.99", MAC: "00:1C:42:11:22:33"}, mdns.DeviceDetails{
 		Hostname: "MacBook",
-	}, "Apple", now.Add(time.Second))
+	}, "Apple", now.Add(time.Second), map[string]bool{"00:1C:42:11:22:33": true})
 
 	devs := eng.GetDevices()
 	if len(devs) != 1 {
@@ -100,17 +99,16 @@ func TestUpsertStableMACKeepsIDOnIPChange(t *testing.T) {
 }
 
 func TestUpsertPrivateMACMergesOnHostname(t *testing.T) {
-	eng := New()
+	eng := New(nil)
 	now := time.Now()
 
-	// Different IPs so merge must use hostname rule (not IP match).
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.20", MAC: "3A:45:DB:15:44:3D"}, mdns.DeviceDetails{
 		Hostname: "Jared's MacBook Pro",
-	}, "Private / Randomized MAC", now)
+	}, "Private / Randomized MAC", now, nil)
 
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.21", MAC: "3A:11:22:33:44:55"}, mdns.DeviceDetails{
-		Hostname: "jared's macbook pro", // case-insensitive match
-	}, "Private / Randomized MAC", now.Add(time.Second))
+		Hostname: "jared's macbook pro",
+	}, "Private / Randomized MAC", now.Add(time.Second), map[string]bool{"3A:45:DB:15:44:3D": true})
 
 	devs := eng.GetDevices()
 	if len(devs) != 1 {
@@ -132,16 +130,16 @@ func TestUpsertPrivateMACMergesOnHostname(t *testing.T) {
 }
 
 func TestUpsertPrivateMACDifferentHostnameCreatesNew(t *testing.T) {
-	eng := New()
+	eng := New(nil)
 	now := time.Now()
 
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.20", MAC: "3A:45:DB:15:44:3D"}, mdns.DeviceDetails{
 		Hostname: "Jared's MacBook Pro",
-	}, "Private", now)
+	}, "Private", now, nil)
 
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.21", MAC: "3A:11:22:33:44:55"}, mdns.DeviceDetails{
 		Hostname: "Someone's iPhone",
-	}, "Private", now.Add(time.Second))
+	}, "Private", now.Add(time.Second), nil)
 
 	devs := eng.GetDevices()
 	if len(devs) != 2 {
@@ -150,10 +148,10 @@ func TestUpsertPrivateMACDifferentHostnameCreatesNew(t *testing.T) {
 }
 
 func TestUpsertUnknownMACFallsBackToIP(t *testing.T) {
-	eng := New()
+	eng := New(nil)
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.50", MAC: ""}, mdns.DeviceDetails{
 		Hostname: "mystery",
-	}, "Unknown", time.Now())
+	}, "Unknown", time.Now(), nil)
 
 	devs := eng.GetDevices()
 	if len(devs) != 1 {
@@ -161,5 +159,62 @@ func TestUpsertUnknownMACFallsBackToIP(t *testing.T) {
 	}
 	if devs[0].ID != "ip:192.168.1.50" {
 		t.Errorf("expected ip: fallback id, got %q", devs[0].ID)
+	}
+}
+
+func TestDisplayNameAndType(t *testing.T) {
+	d := Device{IP: "10.0.0.1", Hostname: "host", Vendor: "Apple", DeviceType: "Computer"}
+	if d.DisplayName() != "host" {
+		t.Fatalf("DisplayName=%q", d.DisplayName())
+	}
+	d.CustomName = "My Mac"
+	if d.DisplayName() != "My Mac" {
+		t.Fatalf("CustomName DisplayName=%q", d.DisplayName())
+	}
+	if d.DisplayType() != "Computer" {
+		t.Fatalf("DisplayType=%q", d.DisplayType())
+	}
+	d.DeviceTypeOverride = "Laptop"
+	if d.DisplayType() != "Laptop" {
+		t.Fatalf("override DisplayType=%q", d.DisplayType())
+	}
+}
+
+func TestPatchDevicePersistsOverrides(t *testing.T) {
+	eng := New(nil)
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.10", MAC: "00:1C:42:11:22:33"}, mdns.DeviceDetails{
+		Hostname:   "MacBook",
+		DeviceType: "Computer",
+	}, "Apple", time.Now(), nil)
+
+	name := "Office Mac"
+	note := "desk"
+	override := "Laptop"
+	dev, err := eng.PatchDevice("00:1C:42:11:22:33", DevicePatch{
+		CustomName:         &name,
+		Note:               &note,
+		DeviceTypeOverride: &override,
+	})
+	if err != nil {
+		t.Fatalf("PatchDevice: %v", err)
+	}
+	if dev.CustomName != name || dev.Note != note || dev.DeviceTypeOverride != override {
+		t.Fatalf("patch not applied: %+v", dev)
+	}
+
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.1.10", MAC: "00:1C:42:11:22:33"}, mdns.DeviceDetails{
+		Hostname:   "MacBook-Pro",
+		DeviceType: "Computer",
+	}, "Apple", time.Now(), map[string]bool{"00:1C:42:11:22:33": true})
+
+	got, ok := eng.GetDevice("00:1C:42:11:22:33")
+	if !ok {
+		t.Fatal("device missing")
+	}
+	if got.CustomName != name || got.Note != note || got.DeviceTypeOverride != override {
+		t.Fatalf("overrides wiped: %+v", got)
+	}
+	if got.Hostname != "MacBook-Pro" {
+		t.Fatalf("hostname not updated: %q", got.Hostname)
 	}
 }

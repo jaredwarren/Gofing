@@ -272,7 +272,7 @@ type Device struct {
 
 ### Task 1.1 — Wire store into engine lifecycle
 
-- [ ] **Goal:** Devices survive restarts.
+- [x] **Goal:** Devices survive restarts.
 - **Edit:** [`pkg/engine/engine.go`](pkg/engine/engine.go), [`main.go`](main.go), [`pkg/server/server.go`](pkg/server/server.go) if needed
 - **Behavior:**
   - `engine.New(store *store.Store)` (or `SetStore`) loads all devices on startup, marks them `IsOnline=false`.
@@ -283,7 +283,7 @@ type Device struct {
 
 ### Task 1.2 — Presence history API
 
-- [ ] **Goal:** Record and query online/offline (and found) events.
+- [x] **Goal:** Record and query online/offline (and found) events.
 - **Edit:** [`pkg/engine/engine.go`](pkg/engine/engine.go), [`pkg/server/server.go`](pkg/server/server.go), [`pkg/store`](pkg/store)
 - **HTTP:**
   - `GET /api/devices/{id}/history?limit=50` → `{ "events": [...] }`
@@ -293,7 +293,7 @@ type Device struct {
 
 ### Task 1.3 — User-editable device fields
 
-- [ ] **Goal:** Custom name, note, type override.
+- [x] **Goal:** Custom name, note, type override.
 - **Edit:** engine Device fields, [`pkg/server/server.go`](pkg/server/server.go)
 - **HTTP:**
   - `PATCH /api/devices/{id}` body:
@@ -307,7 +307,7 @@ type Device struct {
 
 ### Task 1.4 — Tabbed Device Inspection Drawer (shell)
 
-- [ ] **Goal:** Replace the modal with a tabbed drawer so later features have a UI home.
+- [x] **Goal:** Replace the modal with a tabbed drawer so later features have a UI home.
 - **Edit:**
   - [`web/static/index.html`](web/static/index.html) — convert `#deviceModal` into a right-side drawer
   - [`web/static/style.css`](web/static/style.css)

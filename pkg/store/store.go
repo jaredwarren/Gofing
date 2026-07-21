@@ -19,14 +19,8 @@ const (
 	settingsKey    = "settings"
 )
 
-// Event is a persisted presence or alert event.
-type Event struct {
-	ID        string    `json:"id"`
-	Type      string    `json:"type"` // online|offline|found|updated|alert|...
-	DeviceID  string    `json:"device_id,omitempty"`
-	Message   string    `json:"message"`
-	Timestamp time.Time `json:"timestamp"`
-}
+// Event is a persisted presence or alert event (alias of engine.Event).
+type Event = engine.Event
 
 // Settings holds user-configurable runtime preferences.
 type Settings struct {

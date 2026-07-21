@@ -3,9 +3,12 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/jaredwarren/Gofing/pkg/engine"
@@ -28,7 +31,6 @@ func New(devEngine *engine.Engine, staticFS fs.FS) *Server {
 		sseClients: make(map[chan string]bool),
 	}
 
-	// Register SSE broadcast listener with engine
 	devEngine.RegisterEventListener(func(eventType string, data interface{}) {
 		srv.broadcastSSE(eventType, data)
 	})
@@ -40,13 +42,12 @@ func New(devEngine *engine.Engine, staticFS fs.FS) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// API routes
 	mux.HandleFunc("/api/network", s.handleNetworkInfo)
-	mux.HandleFunc("/api/devices", s.handleGetDevices)
+	mux.HandleFunc("/api/devices", s.handleDevicesRoot)
+	mux.HandleFunc("/api/devices/", s.handleDeviceSubpath)
 	mux.HandleFunc("/api/scan", s.handleTriggerScan)
 	mux.HandleFunc("/api/events", s.handleSSE)
 
-	// Static UI assets
 	fileServer := http.FileServer(http.FS(s.staticFS))
 	mux.Handle("/", fileServer)
 
@@ -62,11 +63,98 @@ func (s *Server) handleNetworkInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, info)
 }
 
-func (s *Server) handleGetDevices(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	devices := s.devEngine.GetDevices()
 	writeJSON(w, map[string]interface{}{
 		"devices":     devices,
 		"is_scanning": s.devEngine.IsScanning(),
+	})
+}
+
+// handleDeviceSubpath serves /api/devices/{id} and /api/devices/{id}/history.
+func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/devices/")
+	path = strings.Trim(path, "/")
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	id := parts[0]
+	if id == "" {
+		http.Error(w, "device id required", http.StatusBadRequest)
+		return
+	}
+
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPatch:
+			s.handlePatchDevice(w, r, id)
+		case http.MethodGet:
+			dev, ok := s.devEngine.GetDevice(id)
+			if !ok {
+				http.Error(w, "device not found", http.StatusNotFound)
+				return
+			}
+			writeJSON(w, dev)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "history" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleDeviceHistory(w, r, id)
+		return
+	}
+
+	http.NotFound(w, r)
+}
+
+func (s *Server) handlePatchDevice(w http.ResponseWriter, r *http.Request, id string) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "failed to read body", http.StatusBadRequest)
+		return
+	}
+	var patch engine.DevicePatch
+	if err := json.Unmarshal(body, &patch); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	dev, err := s.devEngine.PatchDevice(id, patch)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, dev)
+}
+
+func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request, id string) {
+	limit := 50
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	events, err := s.devEngine.ListDeviceHistory(id, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"events": events,
 	})
 }
 
@@ -111,7 +199,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		close(clientChan)
 	}()
 
-	// Send initial state message
 	initialBytes, _ := json.Marshal(map[string]interface{}{
 		"devices":     s.devEngine.GetDevices(),
 		"is_scanning": s.devEngine.IsScanning(),
@@ -147,7 +234,6 @@ func (s *Server) broadcastSSE(eventType string, data interface{}) {
 		select {
 		case clientChan <- msg:
 		default:
-			// Buffer full, skip message for slow client
 		}
 	}
 }

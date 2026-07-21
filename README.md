@@ -27,6 +27,7 @@ Flags:
 | `-port` | `8080` | Web UI / API port |
 | `-interval` | `30s` | Background subnet rescan interval |
 | `-open` | `true` | Open the browser on startup |
+| `-data-dir` | Application Support | Directory for `gofing.db` / caches |
 
 ## Data directory
 

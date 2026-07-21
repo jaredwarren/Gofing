@@ -1,10 +1,11 @@
-// Gofing - Real-Time Dashboard Client Logic with Dynamic Category Pills
+// Gofing - Real-Time Dashboard Client Logic with Device Drawer
 document.addEventListener('DOMContentLoaded', () => {
-  let devicesMap = new Map();
+  let devicesMap = new Map(); // keyed by device id
   let currentCategory = 'all';
   let searchQuery = '';
+  let openDeviceId = null;
+  let activeTab = 'overview';
 
-  // Elements
   const ssidNameEl = document.getElementById('ssidName');
   const subnetCidrEl = document.getElementById('subnetCidr');
   const statTotalEl = document.getElementById('statTotal');
@@ -20,39 +21,41 @@ document.addEventListener('DOMContentLoaded', () => {
   const progressBarFill = document.getElementById('progressBarFill');
   const categoryPillsContainer = document.getElementById('categoryPills');
 
-  // Modal elements
-  const deviceModal = document.getElementById('deviceModal');
-  const modalCloseBtn = document.getElementById('modalCloseBtn');
-  const modalTypeIcon = document.getElementById('modalTypeIcon');
-  const modalDeviceName = document.getElementById('modalDeviceName');
-  const modalDeviceSub = document.getElementById('modalDeviceSub');
-  const modalIP = document.getElementById('modalIP');
-  const modalMAC = document.getElementById('modalMAC');
-  const modalVendor = document.getElementById('modalVendor');
-  const modalModel = document.getElementById('modalModel');
-  const modalLatency = document.getElementById('modalLatency');
-  const modalStatus = document.getElementById('modalStatus');
-  const modalFirstSeen = document.getElementById('modalFirstSeen');
-  const modalLastSeen = document.getElementById('modalLastSeen');
-  const modalServices = document.getElementById('modalServices');
+  const deviceDrawer = document.getElementById('deviceDrawer');
+  const drawerCloseBtn = document.getElementById('drawerCloseBtn');
+  const drawerTypeIcon = document.getElementById('drawerTypeIcon');
+  const drawerDeviceName = document.getElementById('drawerDeviceName');
+  const drawerDeviceSub = document.getElementById('drawerDeviceSub');
+  const drawerIP = document.getElementById('drawerIP');
+  const drawerMAC = document.getElementById('drawerMAC');
+  const drawerVendor = document.getElementById('drawerVendor');
+  const drawerModel = document.getElementById('drawerModel');
+  const drawerLatency = document.getElementById('drawerLatency');
+  const drawerStatus = document.getElementById('drawerStatus');
+  const drawerFirstSeen = document.getElementById('drawerFirstSeen');
+  const drawerLastSeen = document.getElementById('drawerLastSeen');
+  const drawerServices = document.getElementById('drawerServices');
+  const editCustomName = document.getElementById('editCustomName');
+  const editTypeOverride = document.getElementById('editTypeOverride');
+  const editNote = document.getElementById('editNote');
+  const saveDeviceBtn = document.getElementById('saveDeviceBtn');
+  const saveStatus = document.getElementById('saveStatus');
+  const historyList = document.getElementById('historyList');
+  const drawerTabs = document.getElementById('drawerTabs');
 
   const copyIPBtn = document.getElementById('copyIPBtn');
   const copyMACBtn = document.getElementById('copyMACBtn');
 
   copyIPBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    const text = modalIP.textContent;
-    if (text && text !== '—') {
-      copyToClipboard(text, copyIPBtn);
-    }
+    const text = drawerIP.textContent;
+    if (text && text !== '—') copyToClipboard(text, copyIPBtn);
   });
 
   copyMACBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    const text = modalMAC.textContent;
-    if (text && text !== '—' && text !== 'Unspecified') {
-      copyToClipboard(text, copyMACBtn);
-    }
+    const text = drawerMAC.textContent;
+    if (text && text !== '—' && text !== 'Unspecified') copyToClipboard(text, copyMACBtn);
   });
 
   function copyToClipboard(text, btnEl) {
@@ -64,23 +67,18 @@ document.addEventListener('DOMContentLoaded', () => {
         btnEl.classList.remove('copied');
         btnEl.innerHTML = origHTML;
       }, 1500);
-    }).catch(err => {
-      console.error('Clipboard copy error:', err);
-    });
+    }).catch(err => console.error('Clipboard copy error:', err));
   }
 
-  // Initialize
   fetchNetworkInfo();
   fetchInitialDevices();
   initSSE();
 
-  // Search input handler
   searchInput.addEventListener('input', (e) => {
     searchQuery = e.target.value.toLowerCase().trim();
     renderTable();
   });
 
-  // Category Pills delegation handler
   categoryPillsContainer.addEventListener('click', (e) => {
     const pill = e.target.closest('.pill');
     if (pill) {
@@ -91,21 +89,52 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Trigger scan button
-  rescanBtn.addEventListener('click', () => {
-    triggerScan();
+  rescanBtn.addEventListener('click', () => triggerScan());
+
+  drawerCloseBtn.addEventListener('click', closeDrawer);
+  deviceDrawer.addEventListener('click', (e) => {
+    if (e.target === deviceDrawer) closeDrawer();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && deviceDrawer.classList.contains('open')) closeDrawer();
   });
 
-  // Close modal
-  modalCloseBtn.addEventListener('click', () => {
-    deviceModal.classList.remove('open');
+  drawerTabs.addEventListener('click', (e) => {
+    const tab = e.target.closest('.drawer-tab');
+    if (!tab) return;
+    setActiveTab(tab.dataset.tab);
   });
 
-  deviceModal.addEventListener('click', (e) => {
-    if (e.target === deviceModal) {
-      deviceModal.classList.remove('open');
+  saveDeviceBtn.addEventListener('click', saveDeviceEdits);
+
+  function deviceKey(dev) {
+    return dev.id || (dev.mac ? dev.mac : `ip:${dev.ip}`);
+  }
+
+  function displayName(dev) {
+    return dev.custom_name || dev.hostname || dev.model || dev.vendor || 'Discovered Device';
+  }
+
+  function displayType(dev) {
+    return dev.device_type_override || dev.device_type || 'Generic Device';
+  }
+
+  function upsertDevice(dev) {
+    const key = deviceKey(dev);
+    // Drop stale IP-only keys if ID is now available
+    if (dev.id) {
+      for (const [k, v] of devicesMap.entries()) {
+        if (k !== key && v.ip === dev.ip && (!v.id || v.id === dev.id)) {
+          devicesMap.delete(k);
+        }
+      }
     }
-  });
+    devicesMap.set(key, dev);
+    if (openDeviceId && (openDeviceId === key || openDeviceId === dev.id)) {
+      openDeviceId = key;
+      fillDrawer(dev);
+    }
+  }
 
   function fetchNetworkInfo() {
     fetch('/api/network')
@@ -124,14 +153,12 @@ document.addEventListener('DOMContentLoaded', () => {
       .then(res => res.json())
       .then(data => {
         if (data.devices) {
-          data.devices.forEach(dev => devicesMap.set(dev.ip, dev));
+          data.devices.forEach(upsertDevice);
           updateCategoryPills();
           renderTable();
           updateMetrics();
         }
-        if (data.is_scanning) {
-          setScanningState(true);
-        }
+        if (data.is_scanning) setScanningState(true);
       })
       .catch(err => console.error('Failed to fetch initial devices:', err));
   }
@@ -142,7 +169,8 @@ document.addEventListener('DOMContentLoaded', () => {
     eventSource.addEventListener('init', (e) => {
       const data = JSON.parse(e.data);
       if (data.devices) {
-        data.devices.forEach(dev => devicesMap.set(dev.ip, dev));
+        devicesMap.clear();
+        data.devices.forEach(upsertDevice);
         updateCategoryPills();
         renderTable();
         updateMetrics();
@@ -156,27 +184,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     eventSource.addEventListener('scan_progress', (e) => {
       const prog = JSON.parse(e.data);
-      if (prog.total > 0) {
-        const pct = Math.round((prog.scanned / prog.total) * 100);
-        showProgress(pct);
-      }
+      if (prog.total > 0) showProgress(Math.round((prog.scanned / prog.total) * 100));
     });
 
-    eventSource.addEventListener('device_found', (e) => {
+    const onDeviceEvent = (e) => {
       const dev = JSON.parse(e.data);
-      devicesMap.set(dev.ip, dev);
+      upsertDevice(dev);
       updateCategoryPills();
       renderTable();
       updateMetrics();
-    });
+    };
 
-    eventSource.addEventListener('device_updated', (e) => {
-      const dev = JSON.parse(e.data);
-      devicesMap.set(dev.ip, dev);
-      updateCategoryPills();
-      renderTable();
-      updateMetrics();
-    });
+    eventSource.addEventListener('device_found', onDeviceEvent);
+    eventSource.addEventListener('device_updated', onDeviceEvent);
+    eventSource.addEventListener('device_offline', onDeviceEvent);
 
     eventSource.addEventListener('scan_complete', () => {
       setScanningState(false);
@@ -220,23 +241,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function updateMetrics() {
     const devices = Array.from(devicesMap.values());
-    const total = devices.length;
-    const online = devices.filter(d => d.is_online).length;
-    const offline = total - online;
-
-    statTotalEl.textContent = total;
-    statOnlineEl.textContent = online;
-    statOfflineEl.textContent = offline;
+    statTotalEl.textContent = devices.length;
+    statOnlineEl.textContent = devices.filter(d => d.is_online).length;
+    statOfflineEl.textContent = devices.filter(d => !d.is_online).length;
   }
 
   function updateCategoryPills() {
     const devices = Array.from(devicesMap.values());
     const typeCounts = new Map();
-
     let onlineCount = 0;
     devices.forEach(d => {
       if (d.is_online) onlineCount++;
-      const t = d.device_type || 'Generic Device';
+      const t = displayType(d);
       typeCounts.set(t, (typeCounts.get(t) || 0) + 1);
     });
 
@@ -244,10 +260,7 @@ document.addEventListener('DOMContentLoaded', () => {
       { id: 'all', label: `All Devices (${devices.length})` },
       { id: 'online', label: `Online (${onlineCount})` }
     ];
-
-    // Sort present device types by count descending
-    const sortedTypes = Array.from(typeCounts.entries()).sort((a, b) => b[1] - a[1]);
-    sortedTypes.forEach(([type, count]) => {
+    Array.from(typeCounts.entries()).sort((a, b) => b[1] - a[1]).forEach(([type, count]) => {
       categories.push({ id: type, label: `${type} (${count})` });
     });
 
@@ -259,18 +272,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function renderTable() {
     const devices = Array.from(devicesMap.values());
-
     const filtered = devices.filter(dev => {
-      // Dynamic category filter
       if (currentCategory === 'online' && !dev.is_online) return false;
-      if (currentCategory !== 'all' && currentCategory !== 'online' && dev.device_type !== currentCategory) return false;
-
-      // Search query filter
+      if (currentCategory !== 'all' && currentCategory !== 'online' && displayType(dev) !== currentCategory) return false;
       if (searchQuery) {
-        const haystack = `${dev.hostname} ${dev.ip} ${dev.mac} ${dev.vendor} ${dev.model} ${dev.device_type}`.toLowerCase();
+        const haystack = `${displayName(dev)} ${dev.hostname || ''} ${dev.ip} ${dev.mac || ''} ${dev.vendor || ''} ${dev.model || ''} ${displayType(dev)} ${dev.note || ''}`.toLowerCase();
         if (!haystack.includes(searchQuery)) return false;
       }
-
       return true;
     });
 
@@ -280,31 +288,26 @@ document.addEventListener('DOMContentLoaded', () => {
           <td colspan="7" style="text-align:center; padding:30px; color:var(--text-muted);">
             No devices found matching current filters.
           </td>
-        </tr>
-      `;
+        </tr>`;
       return;
     }
 
     deviceTableBody.innerHTML = filtered.map(dev => {
-      const iconMarkup = getDeviceSVGIcon(dev);
-      const name = dev.hostname || dev.model || dev.vendor || 'Discovered Device';
+      const key = deviceKey(dev);
       const statusBadge = dev.is_online
         ? `<span class="status-badge online"><span class="pulse-dot"></span> Online</span>`
         : `<span class="status-badge offline">Offline</span>`;
-
       const latencyStr = dev.latency_ms > 0 ? `${dev.latency_ms.toFixed(1)} ms` : '—';
 
       return `
-        <tr data-ip="${dev.ip}">
+        <tr data-id="${escapeHtml(key)}">
           <td>
             <div class="device-type-cell">
-              <div class="device-icon-badge">${iconMarkup}</div>
-              <span>${dev.device_type || 'Device'}</span>
+              <div class="device-icon-badge">${getDeviceSVGIcon(dev)}</div>
+              <span>${escapeHtml(displayType(dev))}</span>
             </div>
           </td>
-          <td>
-            <div class="device-title">${escapeHtml(name)}</div>
-          </td>
+          <td><div class="device-title">${escapeHtml(displayName(dev))}</div></td>
           <td>
             <div>${escapeHtml(dev.vendor || 'Generic')}</div>
             <div style="font-size:12px; color:var(--text-dim);">${escapeHtml(dev.model || '')}</div>
@@ -313,63 +316,137 @@ document.addEventListener('DOMContentLoaded', () => {
             ${statusBadge}
             <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">${latencyStr}</div>
           </td>
-          <td class="font-mono">${dev.ip}</td>
-          <td class="font-mono">${dev.mac || '—'}</td>
+          <td class="font-mono">${escapeHtml(dev.ip)}</td>
+          <td class="font-mono">${escapeHtml(dev.mac || '—')}</td>
           <td>
-            <button class="btn-sm inspect-btn" data-ip="${dev.ip}">Inspect</button>
+            <button class="btn-sm inspect-btn" data-id="${escapeHtml(key)}">Inspect</button>
           </td>
-        </tr>
-      `;
+        </tr>`;
     }).join('');
 
-    // Attach row click listeners
     document.querySelectorAll('.inspect-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        openModal(btn.dataset.ip);
+        openDrawer(btn.dataset.id);
       });
     });
-
-    document.querySelectorAll('#deviceTableBody tr[data-ip]').forEach(tr => {
-      tr.addEventListener('click', () => {
-        openModal(tr.dataset.ip);
-      });
+    document.querySelectorAll('#deviceTableBody tr[data-id]').forEach(tr => {
+      tr.addEventListener('click', () => openDrawer(tr.dataset.id));
     });
   }
 
-  function openModal(ip) {
-    const dev = devicesMap.get(ip);
+  function setActiveTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('.drawer-tab').forEach(t => {
+      t.classList.toggle('active', t.dataset.tab === tab);
+    });
+    document.querySelectorAll('.drawer-tab-panel').forEach(p => {
+      p.classList.toggle('active', p.id === `tab-${tab}`);
+    });
+    if (tab === 'history' && openDeviceId) loadHistory(openDeviceId);
+  }
+
+  function openDrawer(id) {
+    const dev = devicesMap.get(id);
     if (!dev) return;
+    openDeviceId = id;
+    saveStatus.textContent = '';
+    setActiveTab(activeTab === 'history' ? 'history' : 'overview');
+    fillDrawer(dev);
+    deviceDrawer.classList.add('open');
+    if (activeTab === 'history') loadHistory(id);
+  }
 
-    modalTypeIcon.innerHTML = getDeviceSVGIcon(dev, 32);
-    modalDeviceName.textContent = dev.hostname || dev.model || dev.vendor || 'Network Device';
-    modalDeviceSub.textContent = `${dev.device_type || 'Generic Device'} • ${dev.vendor || 'Unknown Vendor'}`;
+  function closeDrawer() {
+    deviceDrawer.classList.remove('open');
+    openDeviceId = null;
+  }
 
-    modalIP.textContent = dev.ip;
-    modalMAC.textContent = dev.mac || 'Unspecified';
-    modalVendor.textContent = dev.vendor || 'Generic Device';
-    modalModel.textContent = dev.model || dev.device_type || 'Standard Network Hardware';
-    modalLatency.textContent = dev.is_online ? (dev.latency_ms > 0 ? `${dev.latency_ms.toFixed(2)} ms` : '< 1 ms') : 'Offline';
-    modalStatus.textContent = dev.is_online ? 'Active / Responding' : 'Offline / Inactive';
+  function fillDrawer(dev) {
+    drawerTypeIcon.innerHTML = getDeviceSVGIcon(dev, 32);
+    drawerDeviceName.textContent = displayName(dev);
+    drawerDeviceSub.textContent = `${displayType(dev)} • ${dev.vendor || 'Unknown Vendor'}`;
 
-    modalFirstSeen.textContent = formatDate(dev.first_seen);
-    modalLastSeen.textContent = formatDate(dev.last_seen);
+    editCustomName.value = dev.custom_name || '';
+    editTypeOverride.value = dev.device_type_override || '';
+    editNote.value = dev.note || '';
 
-    // Tags
+    drawerIP.textContent = dev.ip;
+    drawerMAC.textContent = dev.mac || 'Unspecified';
+    drawerVendor.textContent = dev.vendor || 'Generic Device';
+    drawerModel.textContent = dev.model || displayType(dev) || 'Standard Network Hardware';
+    drawerLatency.textContent = dev.is_online
+      ? (dev.latency_ms > 0 ? `${dev.latency_ms.toFixed(2)} ms` : '< 1 ms')
+      : 'Offline';
+    drawerStatus.textContent = dev.is_online ? 'Active / Responding' : 'Offline / Inactive';
+    drawerFirstSeen.textContent = formatDate(dev.first_seen);
+    drawerLastSeen.textContent = formatDate(dev.last_seen);
+
     let tagsHtml = `<span class="tag">ICMP Ping</span>`;
     if (dev.mac) tagsHtml += `<span class="tag">ARP Cache</span>`;
     if (dev.hostname) tagsHtml += `<span class="tag">mDNS / Reverse DNS</span>`;
     if (dev.services && dev.services.length > 0) {
-      dev.services.forEach(s => {
-        tagsHtml += `<span class="tag">${escapeHtml(s)}</span>`;
-      });
+      dev.services.forEach(s => { tagsHtml += `<span class="tag">${escapeHtml(s)}</span>`; });
     }
-
-    modalServices.innerHTML = tagsHtml;
-    deviceModal.classList.add('open');
+    drawerServices.innerHTML = tagsHtml;
   }
 
-  // Simple Icons brand slug mapping & fallback vector SVGs
+  function saveDeviceEdits() {
+    if (!openDeviceId) return;
+    const id = openDeviceId;
+    saveStatus.textContent = 'Saving…';
+    fetch(`/api/devices/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        custom_name: editCustomName.value.trim(),
+        note: editNote.value.trim(),
+        device_type_override: editTypeOverride.value.trim()
+      })
+    })
+      .then(res => {
+        if (!res.ok) throw new Error('save failed');
+        return res.json();
+      })
+      .then(dev => {
+        upsertDevice(dev);
+        updateCategoryPills();
+        renderTable();
+        saveStatus.textContent = 'Saved';
+        setTimeout(() => { if (saveStatus.textContent === 'Saved') saveStatus.textContent = ''; }, 2000);
+      })
+      .catch(err => {
+        console.error(err);
+        saveStatus.textContent = 'Error saving';
+      });
+  }
+
+  function loadHistory(id) {
+    historyList.innerHTML = `<div class="drawer-empty"><p>Loading…</p></div>`;
+    fetch(`/api/devices/${encodeURIComponent(id)}/history?limit=50`)
+      .then(res => {
+        if (!res.ok) throw new Error('history failed');
+        return res.json();
+      })
+      .then(data => {
+        const events = data.events || [];
+        if (!events.length) {
+          historyList.innerHTML = `<div class="drawer-empty"><p>No history yet</p></div>`;
+          return;
+        }
+        historyList.innerHTML = events.map(ev => `
+          <div class="history-item">
+            <div class="hist-type">${escapeHtml(ev.type || 'event')}</div>
+            <div class="hist-msg">${escapeHtml(ev.message || '')}</div>
+            <div class="hist-time">${formatDate(ev.timestamp)}</div>
+          </div>
+        `).join('');
+      })
+      .catch(() => {
+        historyList.innerHTML = `<div class="drawer-empty"><p>Failed to load history</p></div>`;
+      });
+  }
+
   const simpleIconSlugs = {
     "apple, inc.": "apple",
     "raspberry pi trading ltd": "raspberrypi",
@@ -402,20 +479,18 @@ document.addEventListener('DOMContentLoaded', () => {
   function getDeviceSVGIcon(dev, size = 20) {
     const vendorLower = (dev.vendor || '').toLowerCase();
     const slug = simpleIconSlugs[vendorLower];
-
     if (slug) {
-      return `<img class="simple-icon" src="https://cdn.jsdelivr.net/npm/simple-icons@v11/icons/${slug}.svg" width="${size}" height="${size}" alt="${dev.vendor}" onerror="this.outerHTML=getCategorySVG('${dev.icon}', '${dev.device_type}', ${size})" />`;
+      return `<img class="simple-icon" src="https://cdn.jsdelivr.net/npm/simple-icons@v11/icons/${slug}.svg" width="${size}" height="${size}" alt="${escapeHtml(dev.vendor)}" onerror="this.outerHTML=getCategorySVG('${dev.icon}', '${dev.device_type}', ${size})" />`;
     }
-
-    return getCategorySVG(dev.icon, dev.device_type, size);
+    return getCategorySVG(dev.icon, displayType(dev), size);
   }
 
-  function getCategorySVG(icon, devType, size = 20) {
+  window.getCategorySVG = function getCategorySVG(icon, devType, size = 20) {
     const s = size;
     if (icon === 'router' || devType === 'Router') {
       return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M2 8.5a15 15 0 0 1 20 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>`;
     }
-    if (icon === 'laptop' || devType === 'Computer') {
+    if (icon === 'laptop' || devType === 'Computer' || devType === 'Laptop') {
       return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="2" y1="20" x2="22" y2="20"/></svg>`;
     }
     if (icon === 'smartphone' || devType === 'Mobile Phone') {
@@ -439,15 +514,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (icon === 'cpu' || devType === 'SBC / Server') {
       return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg>`;
     }
-
     return `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>`;
-  }
+  };
 
   function formatDate(isoStr) {
     if (!isoStr) return 'Just now';
     try {
       const d = new Date(isoStr);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
     } catch {
       return 'Just now';
     }
@@ -455,8 +529,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function escapeHtml(str) {
     if (!str) return '';
-    return str.replace(/[&<>"']/g, m => {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
-    });
+    return String(str).replace(/[&<>"']/g, m => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
+    }[m]));
   }
 });

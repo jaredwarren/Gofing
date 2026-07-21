@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +39,13 @@ type Device struct {
 	RiskFindings       []string            `json:"risk_findings,omitempty"`
 }
 
+// DevicePatch is the set of user-editable fields (PATCH /api/devices/{id}).
+type DevicePatch struct {
+	CustomName         *string `json:"custom_name"`
+	Note               *string `json:"note"`
+	DeviceTypeOverride *string `json:"device_type_override"`
+}
+
 // EventFunc is called when a device is discovered or updated.
 type EventFunc func(eventType string, data interface{})
 
@@ -49,14 +57,39 @@ type Engine struct {
 	mdnsResolver *mdns.Resolver
 	listeners    []EventFunc
 	isScanning   bool
+	persist      Persistence
 }
 
-// New returns an initialized Engine.
-func New() *Engine {
-	return &Engine{
+// New returns an initialized Engine. persist may be nil (in-memory only).
+func New(persist Persistence) *Engine {
+	e := &Engine{
 		devices:      make(map[string]*Device),
 		netScanner:   scanner.New(),
 		mdnsResolver: mdns.New(),
+		persist:      persist,
+	}
+	e.loadFromStore()
+	return e
+}
+
+func (e *Engine) loadFromStore() {
+	if e.persist == nil {
+		return
+	}
+	loaded, err := e.persist.LoadDevices()
+	if err != nil || len(loaded) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range loaded {
+		d := loaded[i]
+		d.IsOnline = false
+		if d.ID == "" {
+			d.ID = DeviceID(d.MAC, d.IP)
+		}
+		cp := d
+		e.devices[cp.ID] = &cp
 	}
 }
 
@@ -78,6 +111,25 @@ func (e *Engine) emitEvent(eventType string, data interface{}) {
 	}
 }
 
+func (e *Engine) persistDevice(d Device) {
+	if e.persist == nil {
+		return
+	}
+	_ = e.persist.SaveDevice(d)
+}
+
+func (e *Engine) recordEvent(typ, deviceID, message string) {
+	if e.persist == nil {
+		return
+	}
+	_ = e.persist.AppendEvent(Event{
+		Type:      typ,
+		DeviceID:  deviceID,
+		Message:   message,
+		Timestamp: time.Now(),
+	})
+}
+
 // GetDevices returns all tracked devices sorted by IP address.
 func (e *Engine) GetDevices() []Device {
 	e.mu.RLock()
@@ -93,6 +145,56 @@ func (e *Engine) GetDevices() []Device {
 	})
 
 	return list
+}
+
+// GetDevice returns a device by stable ID.
+func (e *Engine) GetDevice(id string) (Device, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	d, ok := e.devices[id]
+	if !ok {
+		return Device{}, false
+	}
+	return *d, true
+}
+
+// PatchDevice applies user-editable field updates and persists them.
+func (e *Engine) PatchDevice(id string, patch DevicePatch) (Device, error) {
+	e.mu.Lock()
+	d, ok := e.devices[id]
+	if !ok {
+		e.mu.Unlock()
+		return Device{}, fmt.Errorf("device not found")
+	}
+	if patch.CustomName != nil {
+		d.CustomName = *patch.CustomName
+	}
+	if patch.Note != nil {
+		d.Note = *patch.Note
+	}
+	if patch.DeviceTypeOverride != nil {
+		d.DeviceTypeOverride = *patch.DeviceTypeOverride
+	}
+	out := *d
+	e.mu.Unlock()
+
+	e.persistDevice(out)
+	e.emitEvent("device_updated", &out)
+	return out, nil
+}
+
+// ListDeviceHistory returns newest-first presence events for a device.
+func (e *Engine) ListDeviceHistory(id string, limit int) ([]Event, error) {
+	if _, ok := e.GetDevice(id); !ok {
+		return nil, fmt.Errorf("device not found")
+	}
+	if e.persist == nil {
+		return []Event{}, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	return e.persist.ListEvents(id, limit)
 }
 
 // IsScanning returns true if a scan is currently running.
@@ -135,8 +237,11 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	}
 
 	now := time.Now()
+	wasOnline := make(map[string]bool)
+
 	e.mu.Lock()
-	for _, dev := range e.devices {
+	for id, dev := range e.devices {
+		wasOnline[id] = dev.IsOnline
 		dev.IsOnline = false
 	}
 	e.mu.Unlock()
@@ -164,12 +269,32 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 				}
 
 				details := e.mdnsResolver.ResolveDevice(raw.IP, raw.MAC, macVendor, isGateway, hostCompName)
-				e.upsertDevice(raw, details, macVendor, now)
+				e.upsertDevice(raw, details, macVendor, now, wasOnline)
 			}
 		}()
 	}
 
 	wg.Wait()
+
+	// Persist offline transitions and final offline state.
+	e.mu.Lock()
+	var wentOffline []Device
+	var allDevices []Device
+	for id, dev := range e.devices {
+		allDevices = append(allDevices, *dev)
+		if wasOnline[id] && !dev.IsOnline {
+			wentOffline = append(wentOffline, *dev)
+		}
+	}
+	e.mu.Unlock()
+
+	for _, d := range wentOffline {
+		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
+		e.emitEvent("device_offline", d)
+	}
+	for _, d := range allDevices {
+		e.persistDevice(d)
+	}
 
 	finalList := e.GetDevices()
 	e.emitEvent("scan_complete", map[string]interface{}{
@@ -182,7 +307,7 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 
 // upsertDevice merges a scanned host into inventory using stable identity rules.
 // Caller must NOT hold e.mu.
-func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time) {
+func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time, wasOnline map[string]bool) {
 	normMAC := NormalizeMAC(raw.MAC)
 	private := IsPrivateMAC(normMAC)
 
@@ -209,12 +334,21 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 			LastSeen:     now,
 		}
 		e.devices[id] = newDev
+		out := *newDev
 		e.mu.Unlock()
-		e.emitEvent("device_found", newDev)
+
+		e.persistDevice(out)
+		e.recordEvent("found", out.ID, fmt.Sprintf("Discovered %s (%s)", out.DisplayName(), out.IP))
+		e.emitEvent("device_found", &out)
 		return
 	}
 
-	// IP change for known MAC (or hostname merge): keep ID and FirstSeen.
+	wasPreviouslyOnline := existing.IsOnline
+	if wasOnline != nil {
+		wasPreviouslyOnline = wasOnline[existing.ID]
+	}
+	cameOnline := !wasPreviouslyOnline
+
 	existing.IsOnline = true
 	existing.LastSeen = now
 	existing.LatencyMs = raw.LatencyMs
@@ -231,7 +365,6 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		existing.IsPrivateMAC = private
 		existing.Vendor = macVendor
 
-		// Promote ip:-based identity to MAC identity only. MAC rotations keep the original ID.
 		if strings.HasPrefix(existing.ID, "ip:") {
 			newID := DeviceID(normMAC, raw.IP)
 			if newID != "" && newID != existing.ID {
@@ -245,6 +378,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	if details.Hostname != "" {
 		existing.Hostname = details.Hostname
 	}
+	// Auto-fingerprint must not overwrite user overrides; DeviceType still updates underneath.
 	if details.DeviceType != "" {
 		existing.DeviceType = details.DeviceType
 		existing.Icon = details.Icon
@@ -252,19 +386,23 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	}
 	existing.Services = details.Services
 
+	out := *existing
 	e.mu.Unlock()
-	e.emitEvent("device_updated", existing)
+
+	e.persistDevice(out)
+	if cameOnline {
+		e.recordEvent("online", out.ID, fmt.Sprintf("%s is online", out.DisplayName()))
+	}
+	e.emitEvent("device_updated", &out)
 }
 
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.
 // Must be called with e.mu held.
 func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, found bool, previousMAC string) {
-	// 1. MAC match
 	if normMAC != "" {
 		if d, ok := e.devices[DeviceID(normMAC, "")]; ok {
 			return d, true, ""
 		}
-		// Also scan in case ID was ip:-based but MAC field matches.
 		for _, d := range e.devices {
 			if d.MAC != "" && d.MAC == normMAC {
 				return d, true, ""
@@ -277,7 +415,6 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 		}
 	}
 
-	// 2. IP fallback key
 	if ip != "" {
 		if d, ok := e.devices[DeviceID("", ip)]; ok {
 			return d, true, ""
@@ -289,7 +426,6 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 		}
 	}
 
-	// 3. Private MAC rotation: merge on exact hostname (case-insensitive).
 	if normMAC != "" && IsPrivateMAC(normMAC) && hostname != "" {
 		want := strings.ToLower(strings.TrimSpace(hostname))
 		for _, d := range e.devices {

@@ -115,72 +115,123 @@
     </main>
   </div>
 
-  <!-- Device Detail Modal -->
-  <div class="modal-backdrop" id="deviceModal">
-    <div class="modal-card">
-      <div class="modal-header">
-        <div class="modal-title-group">
-          <div class="modal-icon" id="modalTypeIcon">💻</div>
+  <!-- Device Inspection Drawer -->
+  <div class="drawer-backdrop" id="deviceDrawer">
+    <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawerDeviceName">
+      <div class="drawer-header">
+        <div class="drawer-title-group">
+          <div class="drawer-icon" id="drawerTypeIcon"></div>
           <div>
-            <h2 id="modalDeviceName">Device Details</h2>
-            <span class="modal-subtitle" id="modalDeviceSub">Subnet Device</span>
+            <h2 id="drawerDeviceName">Device Details</h2>
+            <span class="drawer-subtitle" id="drawerDeviceSub">Subnet Device</span>
           </div>
         </div>
-        <button class="modal-close" id="modalCloseBtn">&times;</button>
+        <button class="drawer-close" id="drawerCloseBtn" aria-label="Close">&times;</button>
       </div>
 
-      <div class="modal-body">
-        <div class="modal-grid">
-          <div class="modal-info-item">
-            <span class="info-label">IP Address</span>
-            <div class="copy-val-group">
-              <span class="info-value font-mono" id="modalIP">—</span>
-              <button class="btn-copy" id="copyIPBtn" title="Copy IP Address">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-              </button>
-            </div>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">MAC Address</span>
-            <div class="copy-val-group">
-              <span class="info-value font-mono" id="modalMAC">—</span>
-              <button class="btn-copy" id="copyMACBtn" title="Copy MAC Address">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-              </button>
-            </div>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">Hardware Vendor</span>
-            <span class="info-value" id="modalVendor">—</span>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">Model Fingerprint</span>
-            <span class="info-value" id="modalModel">—</span>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">Ping Latency</span>
-            <span class="info-value text-green" id="modalLatency">—</span>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">Status</span>
-            <span class="info-value" id="modalStatus">—</span>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">First Discovered</span>
-            <span class="info-value" id="modalFirstSeen">—</span>
-          </div>
-          <div class="modal-info-item">
-            <span class="info-label">Last Active</span>
-            <span class="info-value" id="modalLastSeen">—</span>
-          </div>
-        </div>
+      <nav class="drawer-tabs" id="drawerTabs">
+        <button class="drawer-tab active" data-tab="overview">Overview</button>
+        <button class="drawer-tab" data-tab="ports">Ports</button>
+        <button class="drawer-tab" data-tab="history">History</button>
+        <button class="drawer-tab" data-tab="tools">Tools</button>
+        <button class="drawer-tab" data-tab="security">Security</button>
+      </nav>
 
-        <div class="modal-section-title">Discovered Services & Tags</div>
-        <div class="services-tags-container" id="modalServices">
-          <span class="tag">ICMP Ping</span>
-        </div>
+      <div class="drawer-body">
+        <section class="drawer-tab-panel active" id="tab-overview">
+          <div class="drawer-edit-grid">
+            <label class="drawer-field">
+              <span class="info-label">Custom Name</span>
+              <input type="text" id="editCustomName" class="drawer-input" placeholder="Friendly name">
+            </label>
+            <label class="drawer-field">
+              <span class="info-label">Type Override</span>
+              <input type="text" id="editTypeOverride" class="drawer-input" placeholder="e.g. Laptop">
+            </label>
+            <label class="drawer-field drawer-field-full">
+              <span class="info-label">Note</span>
+              <textarea id="editNote" class="drawer-input drawer-textarea" rows="2" placeholder="Optional note"></textarea>
+            </label>
+            <div class="drawer-field drawer-field-full">
+              <button type="button" class="btn-primary btn-save" id="saveDeviceBtn">Save changes</button>
+              <span class="save-status" id="saveStatus"></span>
+            </div>
+          </div>
+
+          <div class="modal-grid">
+            <div class="modal-info-item">
+              <span class="info-label">IP Address</span>
+              <div class="copy-val-group">
+                <span class="info-value font-mono" id="drawerIP">—</span>
+                <button class="btn-copy" id="copyIPBtn" title="Copy IP Address">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">MAC Address</span>
+              <div class="copy-val-group">
+                <span class="info-value font-mono" id="drawerMAC">—</span>
+                <button class="btn-copy" id="copyMACBtn" title="Copy MAC Address">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">Hardware Vendor</span>
+              <span class="info-value" id="drawerVendor">—</span>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">Model Fingerprint</span>
+              <span class="info-value" id="drawerModel">—</span>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">Ping Latency</span>
+              <span class="info-value text-green" id="drawerLatency">—</span>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">Status</span>
+              <span class="info-value" id="drawerStatus">—</span>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">First Discovered</span>
+              <span class="info-value" id="drawerFirstSeen">—</span>
+            </div>
+            <div class="modal-info-item">
+              <span class="info-label">Last Active</span>
+              <span class="info-value" id="drawerLastSeen">—</span>
+            </div>
+          </div>
+
+          <div class="modal-section-title">Discovered Services & Tags</div>
+          <div class="services-tags-container" id="drawerServices"></div>
+        </section>
+
+        <section class="drawer-tab-panel" id="tab-ports">
+          <div class="drawer-empty">
+            <p>Run a port scan — coming in Phase 2</p>
+          </div>
+        </section>
+
+        <section class="drawer-tab-panel" id="tab-history">
+          <div class="history-list" id="historyList">
+            <div class="drawer-empty"><p>No history yet</p></div>
+          </div>
+        </section>
+
+        <section class="drawer-tab-panel" id="tab-tools">
+          <div class="drawer-empty">
+            <p>WOL, Ping, Traceroute — coming in Phase 4</p>
+          </div>
+        </section>
+
+        <section class="drawer-tab-panel" id="tab-security">
+          <div class="drawer-empty">
+            <p>Coming in Phase 5</p>
+          </div>
+        </section>
       </div>
-    </div>
+    </aside>
   </div>
 
   <script src="app.js"></script>

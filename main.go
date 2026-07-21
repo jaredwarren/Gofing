@@ -6,12 +6,14 @@ import (
 	"log"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/engine"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/server"
+	"github.com/jaredwarren/Gofing/pkg/store"
 	"github.com/jaredwarren/Gofing/web"
 )
 
@@ -19,9 +21,22 @@ func main() {
 	portFlag := flag.Int("port", 8080, "Port for the web interface")
 	intervalFlag := flag.Duration("interval", 30*time.Second, "Background network rescan interval")
 	openBrowserFlag := flag.Bool("open", true, "Auto open browser on startup")
+	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
 	flag.Parse()
 
 	log.Println("⚡ Starting Gofing Local Network Discovery Service...")
+
+	dbPath := store.DefaultDBPath()
+	if *dataDirFlag != "" {
+		dbPath = filepath.Join(*dataDirFlag, "gofing.db")
+	}
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		log.Fatalf("❌ Failed to open store: %v", err)
+	}
+	defer db.Close()
+	log.Printf("💾 Store: %s", dbPath)
 
 	netInfo, err := network.GetActiveNetworkInfo()
 	if err != nil {
@@ -31,9 +46,9 @@ func main() {
 	log.Printf("🌐 Active Network Interface: %s (IP: %s, Subnet: %s, Gateway: %s, SSID: %s)",
 		netInfo.InterfaceName, netInfo.IP, netInfo.SubnetCIDR, netInfo.GatewayIP, netInfo.SSID)
 
-	devEngine := engine.New()
+	devEngine := engine.New(db)
+	log.Printf("📂 Loaded %d known devices from store", len(devEngine.GetDevices()))
 
-	// Perform initial scan asynchronously
 	go func() {
 		log.Println("🔍 Performing initial subnet scan...")
 		devices, err := devEngine.PerformScan(netInfo)
@@ -44,7 +59,6 @@ func main() {
 		}
 	}()
 
-	// Start continuous background rescan ticker
 	go func() {
 		ticker := time.NewTicker(*intervalFlag)
 		defer ticker.Stop()
