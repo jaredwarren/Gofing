@@ -9,29 +9,33 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/oui"
+	"github.com/jaredwarren/Gofing/pkg/ports"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
 // Device represents an enriched network device.
 type Device struct {
-	ID                 string    `json:"id"`
-	IP                 string    `json:"ip"`
-	MAC                string    `json:"mac"`
-	PreviousMACs       []string  `json:"previous_macs,omitempty"`
-	Vendor             string    `json:"vendor"`
-	Hostname           string    `json:"hostname"`
-	CustomName         string    `json:"custom_name,omitempty"`
-	Note               string    `json:"note,omitempty"`
-	DeviceType         string    `json:"device_type"`
-	DeviceTypeOverride string    `json:"device_type_override,omitempty"`
-	Icon               string    `json:"icon"`
-	Model              string    `json:"model"`
-	LatencyMs          float64   `json:"latency_ms"`
-	IsOnline           bool      `json:"is_online"`
-	IsPrivateMAC       bool      `json:"is_private_mac"`
-	FirstSeen          time.Time `json:"first_seen"`
-	LastSeen           time.Time `json:"last_seen"`
-	Services           []string  `json:"services"`
+	ID                 string              `json:"id"`
+	IP                 string              `json:"ip"`
+	MAC                string              `json:"mac"`
+	PreviousMACs       []string            `json:"previous_macs,omitempty"`
+	Vendor             string              `json:"vendor"`
+	Hostname           string              `json:"hostname"`
+	CustomName         string              `json:"custom_name,omitempty"`
+	Note               string              `json:"note,omitempty"`
+	DeviceType         string              `json:"device_type"`
+	DeviceTypeOverride string              `json:"device_type_override,omitempty"`
+	Icon               string              `json:"icon"`
+	Model              string              `json:"model"`
+	LatencyMs          float64             `json:"latency_ms"`
+	IsOnline           bool                `json:"is_online"`
+	IsPrivateMAC       bool                `json:"is_private_mac"`
+	FirstSeen          time.Time           `json:"first_seen"`
+	LastSeen           time.Time           `json:"last_seen"`
+	Services           []string            `json:"services"`
+	OpenPorts          []ports.ServicePort `json:"open_ports,omitempty"`
+	RiskScore          string              `json:"risk_score,omitempty"` // none|low|medium|high
+	RiskFindings       []string            `json:"risk_findings,omitempty"`
 }
 
 // EventFunc is called when a device is discovered or updated.
