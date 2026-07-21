@@ -45,7 +45,7 @@ func TestMergeProbeAndARPIgnoresStaleARP(t *testing.T) {
 		"192.168.0.1": 1.2,
 	}
 	arp := map[string]RawDevice{
-		"192.168.0.1":   {IP: "192.168.0.1", MAC: "AA:BB:CC:DD:EE:01", Iface: "en0"},
+		"192.168.0.1":   {IP: "192.168.0.1", MAC: "AA:BB:CC:DD:EE:01", Iface: "en0", Hostname: "router.local"},
 		"192.168.0.132": {IP: "192.168.0.132", MAC: "28:CD:C1:01:43:34", Iface: "en0"}, // stale
 	}
 
@@ -58,6 +58,56 @@ func TestMergeProbeAndARPIgnoresStaleARP(t *testing.T) {
 	}
 	if got[0].MAC != "AA:BB:CC:DD:EE:01" {
 		t.Fatalf("expected ARP MAC enrichment, got %q", got[0].MAC)
+	}
+	if got[0].Hostname != "router.local" {
+		t.Fatalf("expected ARP hostname enrichment, got %q", got[0].Hostname)
+	}
+}
+
+func TestParseARPLineWithHostname(t *testing.T) {
+	tests := []struct {
+		line         string
+		wantIP       string
+		wantMAC      string
+		wantHostname string
+		wantMatch    bool
+	}{
+		{
+			line:         "amys-mbp.local (192.168.0.142) at 8c:85:90:24:10:b7 on en0 ifscope [ethernet]",
+			wantIP:       "192.168.0.142",
+			wantMAC:      "8C:85:90:24:10:B7",
+			wantHostname: "amys-mbp.local",
+			wantMatch:    true,
+		},
+		{
+			line:         "? (192.168.0.10) at 0:1c:42:11:22:33 on en0 ifscope [ethernet]",
+			wantIP:       "192.168.0.10",
+			wantMAC:      "00:1C:42:11:22:33",
+			wantHostname: "",
+			wantMatch:    true,
+		},
+		{
+			line:      "garbage",
+			wantMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		matches := arpLineRe.FindStringSubmatch(tt.line)
+		if tt.wantMatch && len(matches) < 5 {
+			t.Fatalf("expected match for %q", tt.line)
+		}
+		if !tt.wantMatch {
+			continue
+		}
+		name, ip, mac := matches[1], matches[2], formatMAC(matches[3])
+		host := ""
+		if name != "?" {
+			host = name
+		}
+		if ip != tt.wantIP || mac != tt.wantMAC || host != tt.wantHostname {
+			t.Fatalf("line %q => ip=%q mac=%q host=%q", tt.line, ip, mac, host)
+		}
 	}
 }
 

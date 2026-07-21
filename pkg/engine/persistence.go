@@ -1,6 +1,9 @@
 package engine
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Event is a presence or alert event persisted via Persistence.
 type Event struct {
@@ -28,16 +31,26 @@ func (d Device) DisplayName() string {
 	if d.Hostname != "" {
 		return d.Hostname
 	}
-	if d.Model != "" {
+	if d.Model != "" && !isGenericLabel(d.Model) {
 		return d.Model
 	}
-	if d.Vendor != "" {
+	if d.Vendor != "" && !isGenericLabel(d.Vendor) {
 		return d.Vendor
 	}
 	if d.IP != "" {
 		return d.IP
 	}
 	return "Unknown Device"
+}
+
+func isGenericLabel(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "apple device", "generic device", "network device", "standard network hardware",
+		"unknown vendor", "generic", "device":
+		return true
+	default:
+		return false
+	}
 }
 
 // DisplayType returns the preferred device type (override wins).

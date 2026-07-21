@@ -1,22 +1,21 @@
 package mdns
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // DeviceDetails contains resolved hostnames, friendly names, and inferred device types.
 type DeviceDetails struct {
 	Hostname   string   `json:"hostname"`
+	NameSource string   `json:"name_source,omitempty"`
 	DeviceType string   `json:"device_type"`
 	Icon       string   `json:"icon"`
 	Model      string   `json:"model"`
@@ -25,58 +24,30 @@ type DeviceDetails struct {
 
 // Resolver handles hostname resolution and multi-layer device fingerprinting.
 type Resolver struct {
-	mdnsCache map[string]string
-	cacheMu   sync.RWMutex
+	mdnsCache   map[string]string           // service instance names
+	ipNames     map[string]cachedName       // IP → best Bonjour/DNS name
+	ipHints     map[string]FingerprintHints // IP → TXT-derived model/type
+	cacheMu     sync.RWMutex
 }
 
-// New returns a new Resolver instance.
+// New returns a new Resolver instance and starts background mDNS discovery.
 func New() *Resolver {
 	r := &Resolver{
 		mdnsCache: make(map[string]string),
+		ipNames:   make(map[string]cachedName),
+		ipHints:   make(map[string]FingerprintHints),
 	}
-	go r.preloadmDNSServices()
+	go r.backgroundDiscovery()
 	return r
 }
 
-// Preload mDNS AirPlay, Companion-Link, and GoogleCast service instance names on macOS
-func (r *Resolver) preloadmDNSServices() {
-	// Browse AirPlay services
-	go r.browsemDNSService("_airplay._tcp")
-	// Browse Companion Link services
-	go r.browsemDNSService("_companion-link._tcp")
-	// Browse Google Cast services
-	go r.browsemDNSService("_googlecast._tcp")
-}
-
-func (r *Resolver) browsemDNSService(serviceType string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "dns-sd", "-B", serviceType, "local")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-
-	_ = cmd.Run()
-
-	for _, line := range strings.Split(out.String(), "\n") {
-		line = strings.TrimSpace(line)
-		fields := strings.Fields(line)
-		if len(fields) >= 7 && (fields[1] == "Add" || fields[2] == "Add") {
-			instanceName := strings.Join(fields[6:], " ")
-			if instanceName != "" && !strings.HasPrefix(instanceName, "DNSService") {
-				r.cacheMu.Lock()
-				r.mdnsCache[strings.ToLower(instanceName)] = instanceName
-				r.cacheMu.Unlock()
-			}
-		}
-	}
-}
-
 // ResolveDevice performs multi-layer non-blocking fingerprinting.
-func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway bool, hostComputerName string) DeviceDetails {
+// arpHostname is an optional name from macOS `arp -a` (Bonjour cache).
+func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway bool, hostComputerName string, arpHostname string) DeviceDetails {
 	if isGateway {
 		return DeviceDetails{
-			Hostname:   "Default Gateway / Router (" + vendor + ")",
+			Hostname:   "Network Gateway",
+			NameSource: NameSourceHost,
 			DeviceType: "Router",
 			Icon:       "router",
 			Model:      vendor + " Gateway",
@@ -85,20 +56,53 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 	}
 
 	hostname := ""
+	nameSource := NameSourceNone
 	var services []string
 	var detectedModel string
 	var detectedType string
 	var detectedIcon string
 
-	// Layer 1: Host Mac Detection
+	// Priority 1: Host Mac Detection
 	if hostComputerName != "" {
-		hostname = hostComputerName
-		detectedType = "Computer"
-		detectedIcon = "laptop"
-		detectedModel = "Apple Mac"
+		if h := SanitizeHostname(hostComputerName); h != "" {
+			hostname = h
+			nameSource = NameSourceHost
+			detectedType = "Computer"
+			detectedIcon = "laptop"
+			detectedModel = "Apple Mac"
+		}
 	}
 
-	// Layer 2: iOS Wireless Sync Port (62078) Fingerprinting
+	// Priority 2: ARP / Bonjour name already known to macOS
+	if hostname == "" {
+		if h := normalizeResolvedName(arpHostname); h != "" {
+			hostname = h
+			nameSource = NameSourceARP
+			r.rememberIPName(ip, hostname, NameSourceARP)
+		}
+	}
+
+	// Priority 2b: Background browse / prior deep-lookup cache
+	if hostname == "" {
+		if c := r.cachedForIP(ip); c.Hostname != "" {
+			hostname = c.Hostname
+			nameSource = c.Source
+		}
+	}
+
+	// TXT / service browse fingerprint hints (model, type, services)
+	if hints := r.hintsForIP(ip); hints.Model != "" || hints.DeviceType != "" || len(hints.Services) > 0 {
+		services = append(services, hints.Services...)
+		if detectedModel == "" && hints.Model != "" {
+			detectedModel = hints.Model
+		}
+		if detectedType == "" && hints.DeviceType != "" {
+			detectedType = hints.DeviceType
+			detectedIcon = hints.Icon
+		}
+	}
+
+	// iOS probe contributes type/vendor hints only (not hostname)
 	isIOS := probeIOSSyncPort(ip)
 	if isIOS {
 		services = append(services, "iOS Wireless Sync")
@@ -112,24 +116,21 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 		}
 	}
 
-	// Layer 3: Reverse DNS with 120ms timeout
+	// Priority 3: Reverse DNS / dns-sd PTR (moderate timeout during scans)
 	if hostname == "" {
-		hostname = reverseDNS(ip)
-	}
-
-	// Layer 4: NetBIOS Name Query (UDP 137)
-	if hostname == "" || hostname == ip {
-		if netbiosName := queryNetBIOSName(ip); netbiosName != "" {
-			hostname = netbiosName
+		if h, src := r.LookupHostnameQuick(ip); h != "" {
+			hostname = h
+			nameSource = src
 		}
 	}
 
-	// Layer 5: Google Cast / Nest API (http://<ip>:8008/setup/eureka_info)
-	if ccName := queryChromecastName(ip); ccName != "" {
-		if hostname == "" || hostname == ip {
-			hostname = ccName
-		}
+	// Priority 4: Google Cast / Nest API
+	if ccName := SanitizeHostname(queryChromecastName(ip)); ccName != "" {
 		services = append(services, "Google Cast")
+		if hostname == "" {
+			hostname = ccName
+			nameSource = NameSourceCast
+		}
 		if detectedType == "" {
 			detectedType = "Smart TV"
 			detectedIcon = "tv"
@@ -137,14 +138,14 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 		}
 	}
 
-	// Layer 6: HTTP Title Grabber (http://<ip>:80)
-	if hostname == "" || hostname == ip {
-		if title := fetchHTTPTitle(ip); title != "" {
+	// Priority 5: HTTP Title Grabber
+	if hostname == "" {
+		if title := SanitizeHostname(fetchHTTPTitle(ip)); title != "" {
 			hostname = title
+			nameSource = NameSourceHTTP
 		}
 	}
 
-	// Layer 7: Infer Services & Device Class
 	inferredServices := inferServices(hostname, vendor)
 	services = append(services, inferredServices...)
 
@@ -157,6 +158,7 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 
 	return DeviceDetails{
 		Hostname:   hostname,
+		NameSource: nameSource,
 		DeviceType: devType,
 		Icon:       icon,
 		Model:      model,
@@ -174,19 +176,93 @@ func probeIOSSyncPort(ip string) bool {
 	return false
 }
 
-func reverseDNS(ip string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
-	defer cancel()
-
-	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
-	if err == nil && len(names) > 0 {
-		name := strings.TrimSuffix(names[0], ".")
-		if name != "" {
-			return name
+// normalizeResolvedName turns "AMYS-MBP.local." into "AMYS-MBP".
+func normalizeResolvedName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimSuffix(name, ".")
+	if name == "" {
+		return ""
+	}
+	// Prefer the first label for .local / .lan style names.
+	if i := strings.IndexByte(name, '.'); i > 0 {
+		suffix := strings.ToLower(name[i+1:])
+		if suffix == "local" || suffix == "lan" || suffix == "home" ||
+			strings.HasSuffix(suffix, ".local") || strings.HasSuffix(suffix, ".lan") {
+			name = name[:i]
 		}
 	}
+	return SanitizeHostname(name)
+}
 
-	return ""
+// SanitizeHostname strips junk and rejects names that are not human-readable hostnames.
+// Returns "" if the candidate should not be stored or displayed.
+func SanitizeHostname(name string) string {
+	name = cleanHostname(name)
+	if !isSaneHostname(name) {
+		return ""
+	}
+	return name
+}
+
+// cleanHostname removes non-printable / replacement / invalid UTF-8 bytes.
+func cleanHostname(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	var buf strings.Builder
+	for len(name) > 0 {
+		r, size := utf8.DecodeRuneInString(name)
+		if r == utf8.RuneError && size == 1 {
+			name = name[1:]
+			continue
+		}
+		if r >= 0x20 && r != 0x7F && r != 0xFFFD {
+			buf.WriteRune(r)
+		}
+		name = name[size:]
+	}
+	return strings.TrimSpace(buf.String())
+}
+
+// Names that are valid-looking words but come from protocol noise / dns-sd headers.
+var hostnameDenylist = map[string]struct{}{
+	"record": {}, "rdata": {}, "flags": {}, "domain": {}, "class": {}, "type": {},
+	"add": {}, "remove": {}, "ptr": {}, "srv": {}, "txt": {}, "aaaa": {}, "arpa": {},
+	"local": {}, "localhost": {}, "workgroup": {}, "msbrowse": {}, "__msbrowse__": {},
+	"in-addr": {}, "ip6": {}, "ipv4": {}, "ipv6": {}, "unknown": {}, "generic": {},
+}
+
+// isSaneHostname rejects binary garbage, protocol noise, and control leftovers.
+func isSaneHostname(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	if !utf8.ValidString(name) || strings.ContainsRune(name, 0xFFFD) {
+		return false
+	}
+	if _, blocked := hostnameDenylist[strings.ToLower(name)]; blocked {
+		return false
+	}
+
+	lettersOrDigits := 0
+	for _, r := range name {
+		switch {
+		case r < 0x20 || r == 0x7F:
+			return false
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			lettersOrDigits++
+		case r == '-' || r == '_' || r == '.' || r == ' ' || r == '\'' || r == '’' || r == '(' || r == ')' || r == '/':
+			// allowed punctuation for DNS / friendly names
+		default:
+			if r > 127 {
+				lettersOrDigits++
+			} else {
+				return false
+			}
+		}
+	}
+	return lettersOrDigits >= 2
 }
 
 func queryNetBIOSName(ip string) string {
@@ -214,13 +290,41 @@ func queryNetBIOSName(ip string) string {
 
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
-	if err != nil || n < 72 {
+	if err != nil || n < 57 {
 		return ""
 	}
 
-	nameBytes := buf[57:72]
-	name := strings.TrimSpace(string(nameBytes))
-	return name
+	// NBNS node status replies encode names as 15-byte space-padded ASCII fields.
+	// Scan the payload for the first plausible unique workstation name (suffix 0x00).
+	payload := buf[:n]
+	for i := 0; i+16 <= len(payload); i++ {
+		nameBytes := payload[i : i+15]
+		suffix := payload[i+15]
+		// Common NetBIOS name types: workstation/file server/messenger/domain
+		switch suffix {
+		case 0x00, 0x03, 0x20, 0x1b, 0x1d, 0x1e:
+		default:
+			continue
+		}
+		trimmed := strings.TrimRight(string(nameBytes), " \x00")
+		if sanitized := SanitizeHostname(trimmed); sanitized != "" && isNetBIOSStyleName(sanitized) {
+			return sanitized
+		}
+	}
+	return ""
+}
+
+func isNetBIOSStyleName(name string) bool {
+	if len(name) == 0 || len(name) > 15 {
+		return false
+	}
+	for _, r := range name {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func queryChromecastName(ip string) string {
@@ -340,7 +444,7 @@ func classifyDevice(hostname, vendor string, services []string, mac string) (dev
 		return "Game Console", "gamepad", "Xbox Console"
 	}
 
-	if strings.Contains(hostLower, "macbook") || strings.Contains(hostLower, "imac") || strings.Contains(hostLower, "mac-mini") || strings.Contains(hostLower, "mac-studio") || strings.Contains(hostLower, "macpro") || strings.Contains(hostLower, "laptop") {
+	if strings.Contains(hostLower, "macbook") || strings.Contains(hostLower, "imac") || strings.Contains(hostLower, "mac-mini") || strings.Contains(hostLower, "mac-studio") || strings.Contains(hostLower, "macpro") || strings.Contains(hostLower, "laptop") || strings.Contains(hostLower, "mbp") || strings.HasSuffix(hostLower, "-pro") {
 		return "Computer", "laptop", "Apple Mac"
 	}
 	if strings.Contains(vendorLower, "apple") {

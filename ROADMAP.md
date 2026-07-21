@@ -330,7 +330,7 @@ type Device struct {
 
 ### Task 2.1 — Wire on-demand port scan
 
-- [ ] **Goal:** Use existing [`pkg/ports`](pkg/ports/ports.go) from API + engine.
+- [x] **Goal:** Use existing [`pkg/ports`](pkg/ports/ports.go) from API + engine.
 - **Edit:** [`pkg/engine/engine.go`](pkg/engine/engine.go), [`pkg/server/server.go`](pkg/server/server.go), [`pkg/ports/ports.go`](pkg/ports/ports.go)
 - **HTTP:**
   - `POST /api/devices/{id}/portscan` → starts scan; on completion emit `portscan_complete` with `{ id, open_ports }`; persist `OpenPorts` on device.
@@ -343,7 +343,7 @@ type Device struct {
 
 ### Task 2.2 — Expand common ports + optional deeper scan
 
-- [ ] **Goal:** Richer service list; optional wider scan without blocking UI.
+- [x] **Goal:** Richer service list; optional wider scan without blocking UI.
 - **Edit:** [`pkg/ports/ports.go`](pkg/ports/ports.go)
 - **Behavior:**
   - Expand `CommonPorts` (e.g. 21, 23, 25, 110, 143, 993, 995, 548, 8291, 8443, 9100, …).
@@ -355,7 +355,7 @@ type Device struct {
 
 ### Task 2.3 — Deeper mDNS / hostname fingerprinting
 
-- [ ] **Goal:** Better hostname/model from `dns-sd` TXT and related lookups.
+- [x] **Goal:** Better hostname/model from `dns-sd` TXT and related lookups.
 - **Edit:** [`pkg/mdns/mdns.go`](pkg/mdns/mdns.go), tests
 - **Behavior:**
   - Resolve service instances with `dns-sd -L` (timeout-bounded) and parse TXT for model/OS hints when available.
@@ -366,7 +366,7 @@ type Device struct {
 
 ### Task 2.4 — Wire Ports + History tabs
 
-- [ ] **Goal:** Drawer Ports/History tabs are functional.
+- [x] **Goal:** Drawer Ports/History tabs are functional.
 - **Edit:** [`web/static/app.js`](web/static/app.js), HTML/CSS as needed
 - **Behavior:**
   - Ports: button “Scan ports” → `POST .../portscan`; show spinner; render open ports; listen for `portscan_complete`.
@@ -441,8 +441,9 @@ type Device struct {
 
 ### Task 4.3 — Reverse DNS helper
 
-- [ ] **Goal:** `LookupAddr` for device IP.
+- [x] **Goal:** `LookupAddr` for device IP.
 - **HTTP:** `GET /api/devices/{id}/rdns` → `{ "names": ["..."] }`
+- **Also:** `POST /api/devices/{id}/resolve-name` deep-looks up Bonjour/DNS, persists via ranked name sources.
 - **Acceptance:** Returns names or empty array; timeout bounded.
 - **Depends on:** 1.1.
 
@@ -459,6 +460,7 @@ type Device struct {
 
 - [ ] **Goal:** Drawer Tools tab drives WOL / ping / traceroute / rDNS.
 - **Edit:** [`web/static/app.js`](web/static/app.js), HTML/CSS
+- **Progress:** Resolve name (force Bonjour/DNS) wired; WOL/ping/traceroute still pending.
 - **Acceptance:** Each action visible and usable from the drawer; output area for streamed tools.
 - **Depends on:** 4.1–4.3, 1.4.
 

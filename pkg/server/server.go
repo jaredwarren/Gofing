@@ -117,6 +117,33 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(parts) == 2 && parts[1] == "rdns" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleDeviceRDNS(w, r, id)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "resolve-name" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleResolveName(w, r, id)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "portscan" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handlePortScan(w, r, id)
+		return
+	}
+
 	http.NotFound(w, r)
 }
 
@@ -155,6 +182,68 @@ func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request, id 
 	}
 	writeJSON(w, map[string]interface{}{
 		"events": events,
+	})
+}
+
+func (s *Server) handleDeviceRDNS(w http.ResponseWriter, r *http.Request, id string) {
+	res, err := s.devEngine.LookupDeviceNames(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	names := make([]string, 0, len(res.Candidates))
+	for _, c := range res.Candidates {
+		names = append(names, c.Hostname)
+	}
+	if len(names) == 0 && res.Hostname != "" {
+		names = append(names, res.Hostname)
+	}
+	writeJSON(w, map[string]interface{}{
+		"names":       names,
+		"hostname":    res.Hostname,
+		"name_source": res.NameSource,
+		"candidates":  res.Candidates,
+	})
+}
+
+func (s *Server) handleResolveName(w http.ResponseWriter, r *http.Request, id string) {
+	res, err := s.devEngine.ResolveDeviceName(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, res)
+}
+
+func (s *Server) handlePortScan(w http.ResponseWriter, r *http.Request, id string) {
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = "common"
+	}
+	mode = strings.ToLower(mode)
+
+	started, err := s.devEngine.TryStartPortScan(id, mode)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !started {
+		writeJSON(w, map[string]string{
+			"status": "already_running",
+			"id":     id,
+			"mode":   mode,
+		})
+		return
+	}
+
+	writeJSON(w, map[string]string{
+		"status": "scan_started",
+		"id":     id,
+		"mode":   mode,
 	})
 }
 

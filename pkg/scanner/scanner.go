@@ -19,6 +19,7 @@ import (
 type RawDevice struct {
 	IP        string    `json:"ip"`
 	MAC       string    `json:"mac"`
+	Hostname  string    `json:"hostname,omitempty"` // from macOS `arp -a` when known
 	Iface     string    `json:"iface"`
 	LatencyMs float64   `json:"latency_ms"`
 	IsOnline  bool      `json:"is_online"`
@@ -59,7 +60,7 @@ func (s *Scanner) PerformScan(subnetCIDR string, progressCb func(scannedCount, t
 	return mergeProbeAndARP(pingResults, arpByIP, time.Now()), nil
 }
 
-// mergeProbeAndARP returns only hosts that answered a probe, enriched with ARP MACs.
+// mergeProbeAndARP returns only hosts that answered a probe, enriched with ARP MAC/hostname.
 // ARP-only entries (stale cache) are intentionally excluded.
 func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevice, now time.Time) []RawDevice {
 	var result []RawDevice
@@ -73,6 +74,7 @@ func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevi
 		if arp, ok := arpByIP[ip]; ok {
 			dev.MAC = arp.MAC
 			dev.Iface = arp.Iface
+			dev.Hostname = arp.Hostname
 		}
 		result = append(result, dev)
 	}
@@ -86,8 +88,8 @@ func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) m
 	total := len(ips)
 	var processed int32
 
-	// High concurrency worker pool for sub-second sweep
-	concurrency := 128
+	// Moderate concurrency — 128 parallel probes floods Wi‑Fi and causes false misses.
+	concurrency := 48
 	ipChan := make(chan string, total)
 	for _, ip := range ips {
 		ipChan <- ip
@@ -122,12 +124,12 @@ func (s *Scanner) pingSweep(ips []string, progressCb func(scanned, total int)) m
 }
 
 func pingIPFast(ip string) (float64, bool) {
-	// 1. Try TCP probe on common ports with 50ms timeout
-	commonPorts := []string{"80", "443", "22", "445", "53", "8080"}
+	// TCP probes first — moderately patient to avoid Wi‑Fi false negatives.
+	commonPorts := []string{"80", "443", "22", "445", "53", "8080", "548", "5000"}
 	start := time.Now()
 
 	for _, port := range commonPorts {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), 40*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), 100*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			lat := float64(time.Since(start).Microseconds()) / 1000.0
@@ -135,11 +137,22 @@ func pingIPFast(ip string) (float64, bool) {
 		}
 	}
 
-	// 2. Native macOS ping with strict 150ms Context Timeout (NO -W 150 which macOS treats as 150 SECONDS!)
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	// ICMP with one retry. macOS ping -W is milliseconds to wait for a reply.
+	if lat, ok := pingOnce(ip, 400*time.Millisecond); ok {
+		return lat, true
+	}
+	return pingOnce(ip, 500*time.Millisecond)
+}
+
+func pingOnce(ip string, timeout time.Duration) (float64, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+200*time.Millisecond)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ping", "-c", "1", ip)
+	waitMs := int(timeout / time.Millisecond)
+	if waitMs < 1 {
+		waitMs = 1
+	}
+	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", strconv.Itoa(waitMs), ip)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
@@ -154,7 +167,6 @@ func pingIPFast(ip string) (float64, bool) {
 		}
 		return float64(duration.Milliseconds()), true
 	}
-
 	return 0, false
 }
 
@@ -170,10 +182,17 @@ func parsePingLatency(output string) float64 {
 	return 0
 }
 
-var arpLineRe = regexp.MustCompile(`\?\s+\(([\d\.]+)\)\s+at\s+([a-fA-F0-9:]+)\s+on\s+(\w+)`)
+// arpLineRe matches both:
+//
+//	? (192.168.0.1) at aa:bb:... on en0 ...
+//	amys-mbp.local (192.168.0.142) at 8c:85:... on en0 ...
+//
+// Use `arp -a` (not -an) so Bonjour names are present when macOS knows them.
+var arpLineRe = regexp.MustCompile(`^(\S+)\s+\(([\d.]+)\)\s+at\s+([0-9a-fA-F:]+)\s+on\s+(\w+)`)
 
 func (s *Scanner) parsemacOSARPTable() ([]RawDevice, error) {
-	cmd := exec.Command("arp", "-an")
+	// `-a` (not `-n`) includes mDNS/Bonjour hostnames when cached.
+	cmd := exec.Command("arp", "-a")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
@@ -181,39 +200,62 @@ func (s *Scanner) parsemacOSARPTable() ([]RawDevice, error) {
 		return nil, err
 	}
 
-	var devices []RawDevice
-	scanner := bufio.NewScanner(&out)
-	now := time.Now()
+	return parseARPTableOutput(out.String(), time.Now()), nil
+}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		matches := arpLineRe.FindStringSubmatch(line)
-		if len(matches) >= 4 {
-			ip := matches[1]
-			macRaw := matches[2]
-			iface := matches[3]
-
-			formattedMAC := formatMAC(macRaw)
-
-			// Filter out incomplete, broadcast, or IPv4/IPv6 Multicast MACs (01:00:5E:... / 33:33:...)
-			if macRaw == "(incomplete)" || formattedMAC == "FF:FF:FF:FF:FF:FF" ||
-				strings.HasPrefix(formattedMAC, "01:00:5E") || strings.HasPrefix(formattedMAC, "33:33:") ||
-				isMulticastIP(ip) {
-				continue
-			}
-
-			devices = append(devices, RawDevice{
-				IP:        ip,
-				MAC:       formattedMAC,
-				Iface:     iface,
-				IsOnline:  true,
-				LastSeen:  now,
-				LatencyMs: 0,
-			})
+// ARPHostname returns the Bonjour/mDNS name for ip from `arp -a`, if present.
+func (s *Scanner) ARPHostname(ip string) string {
+	devices, err := s.parsemacOSARPTable()
+	if err != nil {
+		return ""
+	}
+	for _, d := range devices {
+		if d.IP == ip && d.Hostname != "" {
+			return d.Hostname
 		}
 	}
+	return ""
+}
 
-	return devices, nil
+func parseARPTableOutput(text string, now time.Time) []RawDevice {
+	var devices []RawDevice
+	scanner := bufio.NewScanner(strings.NewReader(text))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		matches := arpLineRe.FindStringSubmatch(line)
+		if len(matches) < 5 {
+			continue
+		}
+		name := matches[1]
+		ip := matches[2]
+		macRaw := matches[3]
+		iface := matches[4]
+
+		formattedMAC := formatMAC(macRaw)
+
+		if macRaw == "(incomplete)" || formattedMAC == "FF:FF:FF:FF:FF:FF" ||
+			strings.HasPrefix(formattedMAC, "01:00:5E") || strings.HasPrefix(formattedMAC, "33:33:") ||
+			isMulticastIP(ip) {
+			continue
+		}
+
+		hostname := ""
+		if name != "?" {
+			hostname = name
+		}
+
+		devices = append(devices, RawDevice{
+			IP:       ip,
+			MAC:      formattedMAC,
+			Hostname: hostname,
+			Iface:    iface,
+			IsOnline: true,
+			LastSeen: now,
+		})
+	}
+
+	return devices
 }
 
 func isMulticastIP(ipStr string) bool {

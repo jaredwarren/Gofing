@@ -42,6 +42,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const saveStatus = document.getElementById('saveStatus');
   const historyList = document.getElementById('historyList');
   const drawerTabs = document.getElementById('drawerTabs');
+  const btnResolveName = document.getElementById('btnResolveName');
+  const toolResolveStatus = document.getElementById('toolResolveStatus');
+  const toolResolveOutput = document.getElementById('toolResolveOutput');
+  const btnScanPorts = document.getElementById('btnScanPorts');
+  const btnScanPortsDeep = document.getElementById('btnScanPortsDeep');
+  const portsScanStatus = document.getElementById('portsScanStatus');
+  const portsList = document.getElementById('portsList');
 
   const copyIPBtn = document.getElementById('copyIPBtn');
   const copyMACBtn = document.getElementById('copyMACBtn');
@@ -106,13 +113,39 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   saveDeviceBtn.addEventListener('click', saveDeviceEdits);
+  btnResolveName.addEventListener('click', resolveDeviceName);
+  btnScanPorts.addEventListener('click', () => startPortScan('common'));
+  btnScanPortsDeep.addEventListener('click', () => startPortScan('deep'));
 
   function deviceKey(dev) {
     return dev.id || (dev.mac ? dev.mac : `ip:${dev.ip}`);
   }
 
   function displayName(dev) {
-    return dev.custom_name || dev.hostname || dev.model || dev.vendor || 'Discovered Device';
+    if (dev.custom_name) return dev.custom_name;
+    if (dev.hostname) return dev.hostname;
+    if (dev.model && !isGenericLabel(dev.model)) return dev.model;
+    if (dev.vendor && !isGenericLabel(dev.vendor)) return dev.vendor;
+    return dev.ip || 'Discovered Device';
+  }
+
+  function isGenericLabel(s) {
+    const v = String(s || '').trim().toLowerCase();
+    return [
+      'apple device', 'generic device', 'network device',
+      'standard network hardware', 'unknown vendor', 'generic', 'device'
+    ].includes(v);
+  }
+
+  function formatNameSource(src) {
+    switch (src) {
+      case 'host': return 'This Mac';
+      case 'arp': return 'Bonjour / ARP';
+      case 'dns': return 'DNS';
+      case 'cast': return 'Cast';
+      case 'http': return 'HTTP title';
+      default: return '—';
+    }
   }
 
   function displayType(dev) {
@@ -193,11 +226,39 @@ document.addEventListener('DOMContentLoaded', () => {
       updateCategoryPills();
       renderTable();
       updateMetrics();
+      if (openDeviceId && deviceKey(dev) === openDeviceId) {
+        fillDrawer(dev);
+      }
     };
 
     eventSource.addEventListener('device_found', onDeviceEvent);
     eventSource.addEventListener('device_updated', onDeviceEvent);
     eventSource.addEventListener('device_offline', onDeviceEvent);
+
+    eventSource.addEventListener('portscan_complete', (e) => {
+      const data = JSON.parse(e.data);
+      const id = data.id;
+      const dev = devicesMap.get(id);
+      if (dev) {
+        dev.open_ports = data.open_ports || [];
+        upsertDevice(dev);
+        if (openDeviceId === id) {
+          renderPortsList(dev.open_ports);
+          portsScanStatus.textContent = `Found ${(dev.open_ports || []).length} open port(s)`;
+          portsScanStatus.className = 'tool-status ok';
+          setPortsScanning(false);
+        }
+      }
+    });
+
+    eventSource.addEventListener('portscan_error', (e) => {
+      const data = JSON.parse(e.data);
+      if (openDeviceId === data.id) {
+        portsScanStatus.textContent = data.error || 'Port scan failed';
+        portsScanStatus.className = 'tool-status err';
+        setPortsScanning(false);
+      }
+    });
 
     eventSource.addEventListener('scan_complete', () => {
       setScanningState(false);
@@ -344,6 +405,10 @@ document.addEventListener('DOMContentLoaded', () => {
       p.classList.toggle('active', p.id === `tab-${tab}`);
     });
     if (tab === 'history' && openDeviceId) loadHistory(openDeviceId);
+    if (tab === 'ports' && openDeviceId) {
+      const dev = devicesMap.get(openDeviceId);
+      if (dev) renderPortsList(dev.open_ports);
+    }
   }
 
   function openDrawer(id) {
@@ -351,6 +416,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!dev) return;
     openDeviceId = id;
     saveStatus.textContent = '';
+    toolResolveStatus.textContent = '';
+    toolResolveStatus.className = 'tool-status';
+    toolResolveOutput.hidden = true;
+    toolResolveOutput.textContent = '';
+    portsScanStatus.textContent = '';
+    portsScanStatus.className = 'tool-status';
+    setPortsScanning(false);
     setActiveTab(activeTab === 'history' ? 'history' : 'overview');
     fillDrawer(dev);
     deviceDrawer.classList.add('open');
@@ -375,6 +447,10 @@ document.addEventListener('DOMContentLoaded', () => {
     drawerMAC.textContent = dev.mac || 'Unspecified';
     drawerVendor.textContent = dev.vendor || 'Generic Device';
     drawerModel.textContent = dev.model || displayType(dev) || 'Standard Network Hardware';
+    const nameSourceEl = document.getElementById('drawerNameSource');
+    if (nameSourceEl) {
+      nameSourceEl.textContent = formatNameSource(dev.name_source);
+    }
     drawerLatency.textContent = dev.is_online
       ? (dev.latency_ms > 0 ? `${dev.latency_ms.toFixed(2)} ms` : '< 1 ms')
       : 'Offline';
@@ -389,6 +465,67 @@ document.addEventListener('DOMContentLoaded', () => {
       dev.services.forEach(s => { tagsHtml += `<span class="tag">${escapeHtml(s)}</span>`; });
     }
     drawerServices.innerHTML = tagsHtml;
+    renderPortsList(dev.open_ports);
+  }
+
+  function renderPortsList(openPorts) {
+    const ports = openPorts || [];
+    if (!ports.length) {
+      portsList.innerHTML = `<div class="drawer-empty"><p>No open ports recorded</p></div>`;
+      return;
+    }
+    portsList.innerHTML = ports.map(p => `
+      <div class="port-row">
+        <span class="port-num">${escapeHtml(String(p.port))}</span>
+        <span class="port-name">${escapeHtml(p.name || '')}</span>
+      </div>
+    `).join('');
+  }
+
+  function setPortsScanning(busy) {
+    btnScanPorts.disabled = busy;
+    btnScanPortsDeep.disabled = busy;
+  }
+
+  function startPortScan(mode) {
+    if (!openDeviceId) return;
+    const id = openDeviceId;
+    setPortsScanning(true);
+    portsScanStatus.className = 'tool-status';
+    portsScanStatus.textContent = mode === 'deep'
+      ? 'Deep scanning ports 1–1024…'
+      : 'Scanning common ports…';
+
+    const q = mode === 'deep' ? '?mode=deep' : '?mode=common';
+    fetch(`/api/devices/${encodeURIComponent(id)}/portscan${q}`, { method: 'POST' })
+      .then(res => {
+        if (!res.ok) throw new Error('port scan failed');
+        return res.json();
+      })
+      .then(data => {
+        if (data.status === 'already_running') {
+          portsScanStatus.textContent = 'Scan already running…';
+          return;
+        }
+        // Results arrive via SSE portscan_complete / portscan_error.
+        // Keep a long safety timeout only if SSE is dropped.
+        setTimeout(() => {
+          if (btnScanPorts.disabled && openDeviceId === id) {
+            const dev = devicesMap.get(id);
+            if (dev && dev.open_ports) renderPortsList(dev.open_ports);
+            setPortsScanning(false);
+            if (portsScanStatus.textContent.includes('Scanning') || portsScanStatus.textContent.includes('Deep')) {
+              portsScanStatus.textContent = 'Scan finished (refresh if ports missing)';
+            }
+          }
+        }, mode === 'deep' ? 45000 : 15000);
+      })
+      .catch(err => {
+        console.error(err);
+        portsScanStatus.textContent = 'Port scan failed';
+        portsScanStatus.className = 'tool-status err';
+        setPortsScanning(false);
+      });
   }
 
   function saveDeviceEdits() {
@@ -444,6 +581,53 @@ document.addEventListener('DOMContentLoaded', () => {
       })
       .catch(() => {
         historyList.innerHTML = `<div class="drawer-empty"><p>Failed to load history</p></div>`;
+      });
+  }
+
+  function resolveDeviceName() {
+    if (!openDeviceId) return;
+    const id = openDeviceId;
+    btnResolveName.disabled = true;
+    toolResolveStatus.className = 'tool-status';
+    toolResolveStatus.textContent = 'Looking up Bonjour / DNS…';
+    toolResolveOutput.hidden = true;
+
+    fetch(`/api/devices/${encodeURIComponent(id)}/resolve-name`, { method: 'POST' })
+      .then(res => {
+        if (!res.ok) throw new Error('resolve failed');
+        return res.json();
+      })
+      .then(data => {
+        if (data.device) {
+          upsertDevice(data.device);
+          updateCategoryPills();
+          renderTable();
+          if (openDeviceId === id) fillDrawer(data.device);
+        }
+        const msg = data.message
+          || (data.changed ? `Resolved to ${data.hostname}` : (data.found ? 'Name unchanged' : 'No name found'));
+        toolResolveStatus.textContent = msg;
+        toolResolveStatus.className = data.found ? 'tool-status ok' : 'tool-status err';
+
+        const lines = [];
+        if (data.hostname) {
+          lines.push(`${data.hostname}  (${formatNameSource(data.name_source)})`);
+        }
+        (data.candidates || []).forEach(c => {
+          lines.push(`· ${c.hostname}  [${formatNameSource(c.source)}]`);
+        });
+        if (lines.length) {
+          toolResolveOutput.textContent = lines.join('\n');
+          toolResolveOutput.hidden = false;
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        toolResolveStatus.textContent = 'Resolve failed';
+        toolResolveStatus.className = 'tool-status err';
+      })
+      .finally(() => {
+        btnResolveName.disabled = false;
       });
   }
 

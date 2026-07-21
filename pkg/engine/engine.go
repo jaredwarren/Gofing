@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +25,7 @@ type Device struct {
 	PreviousMACs       []string            `json:"previous_macs,omitempty"`
 	Vendor             string              `json:"vendor"`
 	Hostname           string              `json:"hostname"`
+	NameSource         string              `json:"name_source,omitempty"` // mdns.NameSource* — ranked persistence
 	CustomName         string              `json:"custom_name,omitempty"`
 	Note               string              `json:"note,omitempty"`
 	DeviceType         string              `json:"device_type"`
@@ -49,24 +53,33 @@ type DevicePatch struct {
 // EventFunc is called when a device is discovered or updated.
 type EventFunc func(eventType string, data interface{})
 
+// offlineMissThreshold is how many consecutive scans must miss a device
+// before it is marked offline. Absorbs flaky Wi‑Fi / probe timeouts.
+const offlineMissThreshold = 3
+
 // Engine coordinates scanning, fingerprinting, and state management.
 type Engine struct {
-	mu           sync.RWMutex
-	devices      map[string]*Device // keyed by stable Device.ID
-	netScanner   *scanner.Scanner
-	mdnsResolver *mdns.Resolver
-	listeners    []EventFunc
-	isScanning   bool
-	persist      Persistence
+	mu              sync.RWMutex
+	devices         map[string]*Device // keyed by stable Device.ID
+	missCount       map[string]int     // consecutive scan misses per device ID
+	portScanMu      sync.Mutex
+	portScanInflight map[string]bool
+	netScanner      *scanner.Scanner
+	mdnsResolver    *mdns.Resolver
+	listeners       []EventFunc
+	isScanning      bool
+	persist         Persistence
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
 func New(persist Persistence) *Engine {
 	e := &Engine{
-		devices:      make(map[string]*Device),
-		netScanner:   scanner.New(),
-		mdnsResolver: mdns.New(),
-		persist:      persist,
+		devices:          make(map[string]*Device),
+		missCount:        make(map[string]int),
+		portScanInflight: make(map[string]bool),
+		netScanner:       scanner.New(),
+		mdnsResolver:     mdns.New(),
+		persist:          persist,
 	}
 	e.loadFromStore()
 	return e
@@ -87,6 +100,10 @@ func (e *Engine) loadFromStore() {
 		d.IsOnline = false
 		if d.ID == "" {
 			d.ID = DeviceID(d.MAC, d.IP)
+		}
+		d.Hostname = mdns.SanitizeHostname(d.Hostname)
+		if d.Hostname == "" {
+			d.NameSource = mdns.NameSourceNone
 		}
 		cp := d
 		e.devices[cp.ID] = &cp
@@ -183,6 +200,245 @@ func (e *Engine) PatchDevice(id string, patch DevicePatch) (Device, error) {
 	return out, nil
 }
 
+// NameResolveResult is returned by ResolveDeviceName.
+type NameResolveResult struct {
+	Device     Device                `json:"device"`
+	Found      bool                  `json:"found"`
+	Changed    bool                  `json:"changed"`
+	Hostname   string                `json:"hostname,omitempty"`
+	NameSource string                `json:"name_source,omitempty"`
+	Candidates []mdns.NameCandidate  `json:"candidates,omitempty"`
+	Message    string                `json:"message,omitempty"`
+}
+
+// ResolveDeviceName force-fetches Bonjour/DNS names for a device and persists
+// an upgrade via ranked PreferHostname.
+func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
+	dev, ok := e.GetDevice(id)
+	if !ok {
+		return NameResolveResult{}, fmt.Errorf("device not found")
+	}
+	if dev.IP == "" {
+		return NameResolveResult{Device: dev, Message: "device has no IP"}, nil
+	}
+
+	// Nudge the host so macOS may refresh ARP / mDNS cache entries.
+	warmHostFn(dev.IP)
+
+	var candidates []mdns.NameCandidate
+	bestName, bestSrc := "", mdns.NameSourceNone
+
+	consider := func(name, source string) {
+		name = mdns.SanitizeHostname(name)
+		if name == "" {
+			return
+		}
+		candidates = append(candidates, mdns.NameCandidate{Hostname: name, Source: source})
+		bestName, bestSrc = mdns.PreferHostname(bestName, bestSrc, name, source)
+	}
+
+	if arpName := e.netScanner.ARPHostname(dev.IP); arpName != "" {
+		consider(arpName, mdns.NameSourceARP)
+	}
+
+	deep := deepLookupFn(e.mdnsResolver, dev.IP)
+	for _, c := range deep.Candidates {
+		consider(c.Hostname, c.Source)
+	}
+	if deep.Hostname != "" {
+		consider(deep.Hostname, deep.NameSource)
+	}
+
+	e.mu.Lock()
+	d, ok := e.devices[id]
+	if !ok {
+		e.mu.Unlock()
+		return NameResolveResult{}, fmt.Errorf("device not found")
+	}
+	before := d.Hostname
+	beforeSrc := d.NameSource
+	if bestName != "" {
+		d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, bestName, bestSrc)
+	}
+	changed := d.Hostname != before || d.NameSource != beforeSrc
+	out := *d
+	e.mu.Unlock()
+
+	if changed {
+		e.persistDevice(out)
+		e.recordEvent("name_resolved", out.ID, fmt.Sprintf("Name resolved to %s", out.Hostname))
+		e.emitEvent("device_updated", &out)
+	}
+
+	res := NameResolveResult{
+		Device:     out,
+		Found:      bestName != "" || out.Hostname != "",
+		Changed:    changed,
+		Hostname:   out.Hostname,
+		NameSource: out.NameSource,
+		Candidates: candidates,
+	}
+	if !res.Found {
+		res.Message = "No Bonjour/DNS name found — device may be offline or not advertising"
+	} else if !changed {
+		res.Message = "Name unchanged (already best known source)"
+	}
+	return res, nil
+}
+
+// LookupDeviceNames returns reverse-DNS / Bonjour candidates without mutating state.
+func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
+	dev, ok := e.GetDevice(id)
+	if !ok {
+		return mdns.LookupResult{}, fmt.Errorf("device not found")
+	}
+	if dev.IP == "" {
+		return mdns.LookupResult{}, nil
+	}
+	warmHostFn(dev.IP)
+	res := deepLookupFn(e.mdnsResolver, dev.IP)
+	if arpName := e.netScanner.ARPHostname(dev.IP); arpName != "" {
+		if h := mdns.SanitizeHostname(arpName); h != "" {
+			res.Candidates = append([]mdns.NameCandidate{{Hostname: h, Source: mdns.NameSourceARP}}, res.Candidates...)
+			res.Hostname, res.NameSource = mdns.PreferHostname(res.Hostname, res.NameSource, h, mdns.NameSourceARP)
+		}
+	}
+	return res, nil
+}
+
+func warmHost(ip string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "500", ip)
+	_ = cmd.Run()
+}
+
+// Test hooks — overridden in unit tests to avoid real network I/O.
+var (
+	warmHostFn = warmHost
+	deepLookupFn = func(r *mdns.Resolver, ip string) mdns.LookupResult {
+		return r.LookupHostnameDeep(ip)
+	}
+)
+
+func (e *Engine) backgroundNameResolve(id string) {
+	select {
+	case nameResolveSem <- struct{}{}:
+		defer func() { <-nameResolveSem }()
+	default:
+		// Already resolving other devices; scan path / manual button can retry.
+		return
+	}
+	_, _ = e.ResolveDeviceName(id)
+}
+
+// Limits concurrent background deep lookups during discovery.
+var nameResolveSem = make(chan struct{}, 2)
+
+// ErrPortScanInProgress is returned when a port scan for the device is already running.
+var ErrPortScanInProgress = fmt.Errorf("port scan already in progress")
+
+func (e *Engine) tryBeginPortScan(id string) bool {
+	e.portScanMu.Lock()
+	defer e.portScanMu.Unlock()
+	if e.portScanInflight[id] {
+		return false
+	}
+	e.portScanInflight[id] = true
+	return true
+}
+
+func (e *Engine) endPortScan(id string) {
+	e.portScanMu.Lock()
+	defer e.portScanMu.Unlock()
+	delete(e.portScanInflight, id)
+}
+
+// TryStartPortScan validates and launches an async port scan. started=false means
+// one is already in flight for this device (not an error).
+func (e *Engine) TryStartPortScan(id, mode string) (started bool, err error) {
+	if _, ok := e.GetDevice(id); !ok {
+		return false, fmt.Errorf("device not found")
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "common"
+	}
+	if mode != "common" && mode != "deep" {
+		return false, fmt.Errorf("invalid mode %q (use common or deep)", mode)
+	}
+	if !e.tryBeginPortScan(id) {
+		return false, nil
+	}
+	go func() {
+		defer e.endPortScan(id)
+		if _, err := e.runPortScan(id, mode); err != nil {
+			log.Printf("port scan %s (%s): %v", id, mode, err)
+			e.emitEvent("portscan_error", map[string]interface{}{
+				"id":    id,
+				"mode":  mode,
+				"error": err.Error(),
+			})
+		}
+	}()
+	return true, nil
+}
+
+// ScanDevicePorts probes a device for open ports and persists the result.
+// mode is "common" (default) or "deep" (ports 1–1024, capped).
+func (e *Engine) ScanDevicePorts(id, mode string) ([]ports.ServicePort, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "common"
+	}
+	if mode != "common" && mode != "deep" {
+		return nil, fmt.Errorf("invalid mode %q (use common or deep)", mode)
+	}
+	if !e.tryBeginPortScan(id) {
+		return nil, ErrPortScanInProgress
+	}
+	defer e.endPortScan(id)
+	return e.runPortScan(id, mode)
+}
+
+func (e *Engine) runPortScan(id, mode string) ([]ports.ServicePort, error) {
+	dev, ok := e.GetDevice(id)
+	if !ok {
+		return nil, fmt.Errorf("device not found")
+	}
+	if dev.IP == "" {
+		return nil, fmt.Errorf("device has no IP")
+	}
+
+	var open []ports.ServicePort
+	switch mode {
+	case "deep":
+		open = ports.ScanPortsRange(dev.IP, ports.DefaultDeepStart, ports.DefaultDeepEnd, 128, 80*time.Millisecond)
+	default:
+		open = ports.ScanPorts(dev.IP)
+	}
+
+	e.mu.Lock()
+	d, ok := e.devices[id]
+	if !ok {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("device not found")
+	}
+	d.OpenPorts = open
+	out := *d
+	e.mu.Unlock()
+
+	e.persistDevice(out)
+	e.recordEvent("portscan", out.ID, fmt.Sprintf("Port scan (%s): %d open", mode, len(open)))
+	e.emitEvent("device_updated", &out)
+	e.emitEvent("portscan_complete", map[string]interface{}{
+		"id":         out.ID,
+		"mode":       mode,
+		"open_ports": open,
+	})
+	return open, nil
+}
+
 // ListDeviceHistory returns newest-first presence events for a device.
 func (e *Engine) ListDeviceHistory(id string, limit int) ([]Event, error) {
 	if _, ok := e.GetDevice(id); !ok {
@@ -242,9 +498,11 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	e.mu.Lock()
 	for id, dev := range e.devices {
 		wasOnline[id] = dev.IsOnline
-		dev.IsOnline = false
 	}
 	e.mu.Unlock()
+
+	seenIDs := make(map[string]bool)
+	var seenMu sync.Mutex
 
 	var wg sync.WaitGroup
 	deviceChan := make(chan scanner.RawDevice, len(rawDevices))
@@ -253,7 +511,7 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	}
 	close(deviceChan)
 
-	concurrency := 32
+	concurrency := 8 // keep low so reverse-DNS/mDNS during fingerprinting stays reliable
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
@@ -268,32 +526,28 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 					hostCompName = netInfo.ComputerName
 				}
 
-				details := e.mdnsResolver.ResolveDevice(raw.IP, raw.MAC, macVendor, isGateway, hostCompName)
-				e.upsertDevice(raw, details, macVendor, now, wasOnline)
+				details := e.mdnsResolver.ResolveDevice(raw.IP, raw.MAC, macVendor, isGateway, hostCompName, raw.Hostname)
+				id := e.upsertDevice(raw, details, macVendor, now, wasOnline)
+				if id != "" {
+					seenMu.Lock()
+					seenIDs[id] = true
+					seenMu.Unlock()
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	// Persist offline transitions and final offline state.
-	e.mu.Lock()
-	var wentOffline []Device
-	var allDevices []Device
-	for id, dev := range e.devices {
-		allDevices = append(allDevices, *dev)
-		if wasOnline[id] && !dev.IsOnline {
-			wentOffline = append(wentOffline, *dev)
-		}
-	}
-	e.mu.Unlock()
+	// Apply offline debounce for devices not seen this scan.
+	wentOffline, toPersist := e.applyMisses(seenIDs, wasOnline)
 
 	for _, d := range wentOffline {
 		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 		e.emitEvent("device_offline", d)
-		e.emitEvent("device_updated", d) // keep UI clients that only listen for updates in sync
+		e.emitEvent("device_updated", d)
 	}
-	for _, d := range allDevices {
+	for _, d := range toPersist {
 		e.persistDevice(d)
 	}
 
@@ -306,9 +560,31 @@ func (e *Engine) PerformScan(netInfo *network.Info) ([]Device, error) {
 	return finalList, nil
 }
 
+// applyMisses increments miss counters for devices absent from this scan and
+// marks them offline only after offlineMissThreshold consecutive misses.
+func (e *Engine) applyMisses(seenIDs, wasOnline map[string]bool) (wentOffline, toPersist []Device) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for id, dev := range e.devices {
+		if seenIDs[id] {
+			e.missCount[id] = 0
+			toPersist = append(toPersist, *dev)
+			continue
+		}
+		e.missCount[id]++
+		if e.missCount[id] >= offlineMissThreshold && dev.IsOnline {
+			dev.IsOnline = false
+			wentOffline = append(wentOffline, *dev)
+		}
+		toPersist = append(toPersist, *dev)
+	}
+	return wentOffline, toPersist
+}
+
 // upsertDevice merges a scanned host into inventory using stable identity rules.
-// Caller must NOT hold e.mu.
-func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time, wasOnline map[string]bool) {
+// Returns the stable device ID. Caller must NOT hold e.mu.
+func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time, wasOnline map[string]bool) string {
 	normMAC := NormalizeMAC(raw.MAC)
 	private := IsPrivateMAC(normMAC)
 
@@ -318,12 +594,14 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 
 	if !found {
 		id := DeviceID(normMAC, raw.IP)
+		host, src := mdns.PreferHostname("", mdns.NameSourceNone, details.Hostname, details.NameSource)
 		newDev := &Device{
 			ID:           id,
 			IP:           raw.IP,
 			MAC:          normMAC,
 			Vendor:       macVendor,
-			Hostname:     details.Hostname,
+			Hostname:     host,
+			NameSource:   src,
 			DeviceType:   details.DeviceType,
 			Icon:         details.Icon,
 			Model:        details.Model,
@@ -335,15 +613,20 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 			LastSeen:     now,
 		}
 		e.devices[id] = newDev
+		e.missCount[id] = 0
 		out := *newDev
 		e.mu.Unlock()
 
 		e.persistDevice(out)
 		e.recordEvent("found", out.ID, fmt.Sprintf("Discovered %s (%s)", out.DisplayName(), out.IP))
 		e.emitEvent("device_found", &out)
-		return
+		if out.Hostname == "" {
+			go e.backgroundNameResolve(out.ID)
+		}
+		return id
 	}
 
+	oldID := existing.ID
 	wasPreviouslyOnline := existing.IsOnline
 	if wasOnline != nil {
 		wasPreviouslyOnline = wasOnline[existing.ID]
@@ -370,22 +653,34 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 			newID := DeviceID(normMAC, raw.IP)
 			if newID != "" && newID != existing.ID {
 				delete(e.devices, existing.ID)
+				delete(e.missCount, existing.ID)
 				existing.ID = newID
 				e.devices[newID] = existing
 			}
 		}
 	}
 
-	if details.Hostname != "" {
-		existing.Hostname = details.Hostname
+	if details.Hostname != "" || details.NameSource != "" {
+		existing.Hostname, existing.NameSource = mdns.PreferHostname(
+			existing.Hostname, existing.NameSource,
+			details.Hostname, details.NameSource,
+		)
 	}
-	// Auto-fingerprint must not overwrite user overrides; DeviceType still updates underneath.
+	// Model/type are fingerprint hints only — never written into Hostname.
 	if details.DeviceType != "" {
 		existing.DeviceType = details.DeviceType
 		existing.Icon = details.Icon
 		existing.Model = details.Model
 	}
 	existing.Services = details.Services
+	e.missCount[existing.ID] = 0
+	if oldID != existing.ID {
+		if wasOnline != nil {
+			if v, ok := wasOnline[oldID]; ok {
+				wasOnline[existing.ID] = v
+			}
+		}
+	}
 
 	out := *existing
 	e.mu.Unlock()
@@ -393,8 +688,12 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	e.persistDevice(out)
 	if cameOnline {
 		e.recordEvent("online", out.ID, fmt.Sprintf("%s is online", out.DisplayName()))
+		if out.Hostname == "" {
+			go e.backgroundNameResolve(out.ID)
+		}
 	}
 	e.emitEvent("device_updated", &out)
+	return out.ID
 }
 
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.

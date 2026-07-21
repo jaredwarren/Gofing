@@ -186,6 +186,10 @@
               <span class="info-value" id="drawerModel">—</span>
             </div>
             <div class="modal-info-item">
+              <span class="info-label">Name Source</span>
+              <span class="info-value" id="drawerNameSource">—</span>
+            </div>
+            <div class="modal-info-item">
               <span class="info-label">Ping Latency</span>
               <span class="info-value text-green" id="drawerLatency">—</span>
             </div>
@@ -208,8 +212,15 @@
         </section>
 
         <section class="drawer-tab-panel" id="tab-ports">
-          <div class="drawer-empty">
-            <p>Run a port scan — coming in Phase 2</p>
+          <div class="ports-panel">
+            <div class="ports-actions">
+              <button type="button" class="btn-tool" id="btnScanPorts">Scan ports</button>
+              <button type="button" class="btn-tool btn-tool-secondary" id="btnScanPortsDeep">Deep scan (1–1024)</button>
+            </div>
+            <div class="tool-status" id="portsScanStatus"></div>
+            <div class="ports-list" id="portsList">
+              <div class="drawer-empty"><p>No port scan yet</p></div>
+            </div>
           </div>
         </section>
 
@@ -220,8 +231,11 @@
         </section>
 
         <section class="drawer-tab-panel" id="tab-tools">
-          <div class="drawer-empty">
-            <p>WOL, Ping, Traceroute — coming in Phase 4</p>
+          <div class="tools-panel">
+            <p class="tools-hint">Force a Bonjour / reverse-DNS lookup for this device. Higher-quality names stick across rescans.</p>
+            <button type="button" class="btn-tool" id="btnResolveName">Resolve name</button>
+            <div class="tool-status" id="toolResolveStatus"></div>
+            <div class="tool-output" id="toolResolveOutput" hidden></div>
           </div>
         </section>
 
