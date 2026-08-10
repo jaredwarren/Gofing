@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -310,7 +310,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 func (s *Server) broadcastSSE(eventType string, data interface{}) {
 	payload, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("SSE marshal error: %v", err)
+		slog.Error("SSE marshal error", "error", err)
 		return
 	}
 

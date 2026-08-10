@@ -15,8 +15,6 @@ import (
 //go:embed nmap-mac-prefixes
 var rawPrefixes string
 
-// New writes go to ~/Library/Application Support/Gofing/oui_cache.json.
-// legacyCacheFileName is only read as a one-time migration fallback from cwd.
 const cacheFileName = "oui_cache.json"
 const legacyCacheFileName = "mac_cache.json"
 
@@ -28,21 +26,43 @@ type macLookupResponse struct {
 	IsPrivate bool   `json:"isPrivate"`
 }
 
-var (
+// DB encapsulates the IEEE OUI prefix map and persistent vendor cache.
+type DB struct {
 	ouiMap     map[string]string
 	diskCache  map[string]string
 	cacheMu    sync.RWMutex
-	initOnce   sync.Once
-	httpClient = &http.Client{Timeout: 1500 * time.Millisecond}
+	dir        string
+	httpClient *http.Client
+}
 
-	// dataDirOverride is used by tests to avoid writing into the real home dir.
-	dataDirOverride string
+var (
+	defaultDB       *DB
+	defaultDBOnce   sync.Once
+	dataDirOverride string // test hook override
 )
 
-func initMap() {
-	ouiMap = make(map[string]string, 55000)
-	diskCache = make(map[string]string)
+// DefaultDB returns the global default OUI database instance.
+func DefaultDB() *DB {
+	defaultDBOnce.Do(func() {
+		dir := dataDir()
+		defaultDB = NewDB(dir)
+	})
+	return defaultDB
+}
 
+// NewDB creates an initialized DB using the specified data directory for cache persistence.
+func NewDB(dir string) *DB {
+	db := &DB{
+		ouiMap:     make(map[string]string, 55000),
+		diskCache:  make(map[string]string),
+		dir:        dir,
+		httpClient: &http.Client{Timeout: 1500 * time.Millisecond},
+	}
+	db.initMap()
+	return db
+}
+
+func (db *DB) initMap() {
 	// 1. Load embedded Nmap OUI database
 	scanner := bufio.NewScanner(strings.NewReader(rawPrefixes))
 	for scanner.Scan() {
@@ -55,17 +75,15 @@ func initMap() {
 			prefix := strings.ToUpper(fields[0])
 			if len(prefix) == 6 {
 				vendor := strings.Join(fields[1:], " ")
-				ouiMap[prefix] = vendor
+				db.ouiMap[prefix] = vendor
 			}
 		}
 	}
 
 	// 2. Load persistent disk cache if present
-	loadDiskCache()
+	db.loadDiskCache()
 }
 
-// dataDir mirrors store.DefaultDataDir without importing store (avoids
-// store → engine → oui → store cycles). Path: ~/Library/Application Support/Gofing
 func dataDir() string {
 	if dataDirOverride != "" {
 		return dataDirOverride
@@ -77,16 +95,24 @@ func dataDir() string {
 	return filepath.Join(home, "Library", "Application Support", "Gofing")
 }
 
-func cachePath() string {
-	return filepath.Join(dataDir(), cacheFileName)
+func (db *DB) cachePath() string {
+	dir := db.dir
+	if dir == "" {
+		dir = dataDir()
+	}
+	return filepath.Join(dir, cacheFileName)
 }
 
-func loadDiskCache() {
-	// Prefer data-dir cache.
-	if data, err := os.ReadFile(cachePath()); err == nil {
+func cachePath() string {
+	return DefaultDB().cachePath()
+}
+
+func (db *DB) loadDiskCache() {
+	cPath := db.cachePath()
+	if data, err := os.ReadFile(cPath); err == nil {
 		var loaded map[string]string
 		if err := json.Unmarshal(data, &loaded); err == nil {
-			diskCache = loaded
+			db.diskCache = loaded
 			return
 		}
 	}
@@ -95,28 +121,34 @@ func loadDiskCache() {
 	if data, err := os.ReadFile(legacyCacheFileName); err == nil {
 		var loaded map[string]string
 		if err := json.Unmarshal(data, &loaded); err == nil {
-			diskCache = loaded
-			saveDiskCache()
+			db.diskCache = loaded
+			db.saveDiskCache()
 		}
 	}
 }
 
-func saveDiskCache() {
-	dir := dataDir()
+func (db *DB) saveDiskCache() {
+	dir := db.dir
+	if dir == "" {
+		dir = dataDir()
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
-	data, err := json.MarshalIndent(diskCache, "", "  ")
+	data, err := json.MarshalIndent(db.diskCache, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(cachePath(), data, 0o644)
+	_ = os.WriteFile(db.cachePath(), data, 0o644)
 }
 
-// LookupVendor checks embedded DB -> disk cache -> maclookup.app API.
+// LookupVendor returns the vendor string for a MAC using the default DB instance.
 func LookupVendor(mac string) string {
-	initOnce.Do(initMap)
+	return DefaultDB().LookupVendor(mac)
+}
 
+// LookupVendor checks embedded DB -> disk cache -> maclookup.app API on the DB instance.
+func (db *DB) LookupVendor(mac string) string {
 	if mac == "" {
 		return "Unknown Vendor"
 	}
@@ -133,14 +165,14 @@ func LookupVendor(mac string) string {
 	prefix := clean[:6]
 
 	// 1. Check embedded 52,000+ IEEE database
-	if vendor, found := ouiMap[prefix]; found && vendor != "" {
+	if vendor, found := db.ouiMap[prefix]; found && vendor != "" {
 		return normalizeVendor(vendor)
 	}
 
 	// 2. Check disk cache
-	cacheMu.RLock()
-	cachedVendor, foundInCache := diskCache[prefix]
-	cacheMu.RUnlock()
+	db.cacheMu.RLock()
+	cachedVendor, foundInCache := db.diskCache[prefix]
+	db.cacheMu.RUnlock()
 
 	if foundInCache {
 		return cachedVendor
@@ -149,30 +181,30 @@ func LookupVendor(mac string) string {
 	// 3. Check locally if it's a randomized private MAC
 	if isRandomizedMAC(clean) {
 		result := "Private / Randomized MAC"
-		cacheMu.Lock()
-		diskCache[prefix] = result
-		saveDiskCache()
-		cacheMu.Unlock()
+		db.cacheMu.Lock()
+		db.diskCache[prefix] = result
+		db.saveDiskCache()
+		db.cacheMu.Unlock()
 		return result
 	}
 
 	// 4. Query maclookup.app API
-	apiVendor := queryMACLookupAPI(clean)
+	apiVendor := db.queryMACLookupAPI(clean)
 	if apiVendor != "" {
 		norm := normalizeVendor(apiVendor)
-		cacheMu.Lock()
-		diskCache[prefix] = norm
-		saveDiskCache()
-		cacheMu.Unlock()
+		db.cacheMu.Lock()
+		db.diskCache[prefix] = norm
+		db.saveDiskCache()
+		db.cacheMu.Unlock()
 		return norm
 	}
 
 	return "Generic Device"
 }
 
-func queryMACLookupAPI(cleanMAC string) string {
+func (db *DB) queryMACLookupAPI(cleanMAC string) string {
 	url := "https://api.maclookup.app/v2/macs/" + cleanMAC
-	resp, err := httpClient.Get(url)
+	resp, err := db.httpClient.Get(url)
 	if err != nil {
 		return ""
 	}

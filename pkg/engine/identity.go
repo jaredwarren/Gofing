@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"net"
 	"strconv"
 	"strings"
+
+	"github.com/jaredwarren/Gofing/pkg/network"
 )
 
 // NormalizeMAC returns an uppercase colon-separated MAC, or "" if invalid/empty.
@@ -38,7 +41,7 @@ func isHex(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F')
 }
 
-// DeviceID returns a stable device identity. Prefer MAC; fall back to ip:<ipv4>.
+// DeviceID returns a stable device identity within a network. Prefer MAC; fall back to ip:<ipv4>.
 func DeviceID(mac, ip string) string {
 	if n := NormalizeMAC(mac); n != "" && looksLikeMAC(n) {
 		return n
@@ -47,6 +50,55 @@ func DeviceID(mac, ip string) string {
 		return "ip:" + ip
 	}
 	return ""
+}
+
+// NetworkKeyFromInfo returns a stable key for the active LAN (SSID preferred, else gateway+subnet).
+func NetworkKeyFromInfo(info *network.Info) string {
+	if info == nil {
+		return ""
+	}
+	ssid := strings.TrimSpace(info.SSID)
+	lower := strings.ToLower(ssid)
+	if ssid != "" && !strings.Contains(lower, "not associated") && !strings.Contains(lower, "error") {
+		// Avoid "/" so ScopedDeviceID can use it as a separator.
+		ssid = strings.ReplaceAll(ssid, "/", "_")
+		return "ssid:" + ssid
+	}
+	if info.GatewayIP != "" && info.SubnetCIDR != "" {
+		return "gw:" + info.GatewayIP + "@" + info.SubnetCIDR
+	}
+	if info.SubnetCIDR != "" {
+		return "subnet:" + info.SubnetCIDR
+	}
+	return ""
+}
+
+// ScopedDeviceID namespaces a device ID by network so the same MAC on two Wi‑Fis
+// does not collide or leak across inventory views.
+func ScopedDeviceID(networkKey, mac, ip string) string {
+	base := DeviceID(mac, ip)
+	if base == "" {
+		return ""
+	}
+	if networkKey == "" {
+		return base
+	}
+	return networkKey + "/" + base
+}
+
+func stripNetworkScope(id string) string {
+	if id == "" {
+		return ""
+	}
+	i := strings.Index(id, "/")
+	if i < 0 {
+		return id
+	}
+	prefix := id[:i]
+	if strings.HasPrefix(prefix, "ssid:") || strings.HasPrefix(prefix, "gw:") || strings.HasPrefix(prefix, "subnet:") {
+		return id[i+1:]
+	}
+	return id
 }
 
 func looksLikeMAC(mac string) bool {
@@ -78,4 +130,19 @@ func IsPrivateMAC(mac string) bool {
 		return false
 	}
 	return first&0x02 != 0
+}
+
+func ipInCIDR(ipStr, cidr string) bool {
+	if ipStr == "" || cidr == "" {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	return network.Contains(ip)
 }

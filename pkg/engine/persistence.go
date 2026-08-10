@@ -20,6 +20,7 @@ type Persistence interface {
 	SaveDevice(d Device) error
 	SaveDevices(devices []Device) error
 	LoadDevices() ([]Device, error)
+	DeleteDevice(id string) error
 	AppendEvent(ev Event) error
 	ListEvents(deviceID string, limit int) ([]Event, error)
 }

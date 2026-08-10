@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
+	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
@@ -57,6 +58,72 @@ func TestDeviceID(t *testing.T) {
 	}
 	if got := DeviceID("", ""); got != "" {
 		t.Errorf("empty id = %q", got)
+	}
+}
+
+func TestNetworkKeyAndScopedID(t *testing.T) {
+	key := NetworkKeyFromInfo(&network.Info{SSID: "HomeWifi", SubnetCIDR: "192.168.1.0/24", GatewayIP: "192.168.1.1"})
+	if key != "ssid:HomeWifi" {
+		t.Fatalf("key=%q", key)
+	}
+	key = NetworkKeyFromInfo(&network.Info{SubnetCIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1"})
+	if key != "gw:10.0.0.1@10.0.0.0/24" {
+		t.Fatalf("key=%q", key)
+	}
+	if got := ScopedDeviceID("ssid:Home", "aa:bb:cc:dd:ee:ff", ""); got != "ssid:Home/AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("scoped=%q", got)
+	}
+	if got := stripNetworkScope("ssid:Home/AA:BB:CC:DD:EE:FF"); got != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("strip=%q", got)
+	}
+}
+
+func TestGetDevicesHidesOtherNetwork(t *testing.T) {
+	eng := New(nil)
+	eng.devices["ssid:Home/AA:BB:CC:DD:EE:01"] = &Device{
+		ID: "ssid:Home/AA:BB:CC:DD:EE:01", NetworkKey: "ssid:Home",
+		IP: "192.168.1.10", MAC: "AA:BB:CC:DD:EE:01", IsOnline: false,
+	}
+	eng.devices["ssid:Cafe/AA:BB:CC:DD:EE:02"] = &Device{
+		ID: "ssid:Cafe/AA:BB:CC:DD:EE:02", NetworkKey: "ssid:Cafe",
+		IP: "10.0.0.5", MAC: "AA:BB:CC:DD:EE:02", IsOnline: false,
+	}
+
+	eng.SetActiveNetwork(&network.Info{SSID: "Home", SubnetCIDR: "192.168.1.0/24", GatewayIP: "192.168.1.1"})
+	devs := eng.GetDevices()
+	if len(devs) != 1 || devs[0].MAC != "AA:BB:CC:DD:EE:01" {
+		t.Fatalf("expected only home device, got %+v", devs)
+	}
+
+	eng.SetActiveNetwork(&network.Info{SSID: "Cafe", SubnetCIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1"})
+	devs = eng.GetDevices()
+	if len(devs) != 1 || devs[0].MAC != "AA:BB:CC:DD:EE:02" {
+		t.Fatalf("expected only cafe device, got %+v", devs)
+	}
+}
+
+func TestApplyMissesIgnoresOtherNetwork(t *testing.T) {
+	eng := New(nil)
+	eng.SetActiveNetwork(&network.Info{SSID: "Home", SubnetCIDR: "192.168.1.0/24", GatewayIP: "192.168.1.1"})
+	home := &Device{
+		ID: "ssid:Home/AA:BB:CC:DD:EE:01", NetworkKey: "ssid:Home",
+		IP: "192.168.1.10", MAC: "AA:BB:CC:DD:EE:01", IsOnline: true,
+	}
+	cafe := &Device{
+		ID: "ssid:Cafe/AA:BB:CC:DD:EE:02", NetworkKey: "ssid:Cafe",
+		IP: "10.0.0.5", MAC: "AA:BB:CC:DD:EE:02", IsOnline: true,
+	}
+	eng.devices[home.ID] = home
+	eng.devices[cafe.ID] = cafe
+
+	for i := 0; i < offlineMissThreshold; i++ {
+		eng.applyMisses(map[string]bool{}, nil)
+	}
+	if eng.devices[home.ID].IsOnline {
+		t.Fatal("home device should be offline after misses")
+	}
+	if !eng.devices[cafe.ID].IsOnline {
+		t.Fatal("cafe device must stay online (other network)")
 	}
 }
 

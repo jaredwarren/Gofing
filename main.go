@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,7 +28,7 @@ func main() {
 	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
 	flag.Parse()
 
-	log.Println("⚡ Starting Gofing Local Network Discovery Service...")
+	slog.Info("⚡ Starting Gofing Local Network Discovery Service...")
 
 	dbPath := store.DefaultDBPath()
 	if *dataDirFlag != "" {
@@ -37,32 +37,40 @@ func main() {
 
 	db, err := store.Open(dbPath)
 	if err != nil {
-		log.Fatalf("❌ Failed to open store: %v", err)
+		slog.Error("❌ Failed to open store", "error", err)
+		os.Exit(1)
 	}
 	defer db.Close()
-	log.Printf("💾 Store: %s", dbPath)
+	slog.Info("💾 Store initialized", "path", dbPath)
 
 	netInfo, err := network.GetActiveNetworkInfo()
 	if err != nil {
-		log.Fatalf("❌ Error detecting active network: %v", err)
+		slog.Error("❌ Error detecting active network", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf("🌐 Active Network Interface: %s (IP: %s, Subnet: %s, Gateway: %s, SSID: %s)",
-		netInfo.InterfaceName, netInfo.IP, netInfo.SubnetCIDR, netInfo.GatewayIP, netInfo.SSID)
+	slog.Info("🌐 Active Network Interface",
+		"iface", netInfo.InterfaceName,
+		"ip", netInfo.IP,
+		"subnet", netInfo.SubnetCIDR,
+		"gateway", netInfo.GatewayIP,
+		"ssid", netInfo.SSID,
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	devEngine := engine.New(db)
-	log.Printf("📂 Loaded %d known devices from store", len(devEngine.GetDevices()))
+	devEngine.SetActiveNetwork(netInfo)
+	slog.Info("📂 Loaded known devices from store", "count", len(devEngine.GetDevices()), "network", engine.NetworkKeyFromInfo(netInfo))
 
 	go func() {
-		log.Println("🔍 Performing initial subnet scan...")
+		slog.Info("🔍 Performing initial subnet scan...")
 		devices, err := devEngine.PerformScan(ctx, netInfo)
 		if err != nil {
-			log.Printf("⚠️ Initial scan error: %v", err)
+			slog.Warn("⚠️ Initial scan error", "error", err)
 		} else {
-			log.Printf("✅ Initial scan completed. Discovered %d devices.", len(devices))
+			slog.Info("✅ Initial scan completed", "discovered_devices", len(devices))
 		}
 	}()
 
@@ -84,7 +92,8 @@ func main() {
 
 	staticFS, err := web.GetStaticFS()
 	if err != nil {
-		log.Fatalf("❌ Failed to load embedded web assets: %v", err)
+		slog.Error("❌ Failed to load embedded web assets", "error", err)
+		os.Exit(1)
 	}
 
 	httpServer := server.New(devEngine, staticFS)
@@ -100,9 +109,10 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("🚀 Gofing Web Interface running at %s", url)
+		slog.Info("🚀 Gofing Web Interface running", "url", url)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("❌ Server error: %v", err)
+			slog.Error("❌ Server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -111,16 +121,16 @@ func main() {
 	}
 
 	<-stop
-	log.Println("🛑 Shutting down Gofing service gracefully...")
+	slog.Info("🛑 Shutting down Gofing service gracefully...")
 	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("⚠️ HTTP shutdown error: %v", err)
+		slog.Warn("⚠️ HTTP shutdown error", "error", err)
 	}
-	log.Println("👋 Store closed. Shutdown complete.")
+	slog.Info("👋 Store closed. Shutdown complete.")
 }
 
 func openBrowser(url string) {

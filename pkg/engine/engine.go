@@ -3,7 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"net/netip"
 	"os/exec"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 // Device represents an enriched network device.
 type Device struct {
 	ID                 string              `json:"id"`
+	NetworkKey         string              `json:"network_key,omitempty"` // SSID / gateway scope
 	IP                 string              `json:"ip"`
 	MAC                string              `json:"mac"`
 	PreviousMACs       []string            `json:"previous_macs,omitempty"`
@@ -71,6 +73,8 @@ type Engine struct {
 	persist          Persistence
 	warmHostFn       func(ip string)
 	deepLookupFn     func(r *mdns.Resolver, ip string) mdns.LookupResult
+	activeNetworkKey string
+	activeSubnetCIDR string
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -139,7 +143,16 @@ func (e *Engine) persistDevice(d Device) {
 		return
 	}
 	if err := e.persist.SaveDevice(d); err != nil {
-		log.Printf("Failed to save device %s: %v", d.ID, err)
+		slog.Error("Failed to save device", "id", d.ID, "error", err)
+	}
+}
+
+func (e *Engine) deletePersisted(id string) {
+	if e.persist == nil || id == "" {
+		return
+	}
+	if err := e.persist.DeleteDevice(id); err != nil {
+		slog.Error("Failed to delete device", "id", id, "error", err)
 	}
 }
 
@@ -148,7 +161,7 @@ func (e *Engine) persistDevices(devices []Device) {
 		return
 	}
 	if err := e.persist.SaveDevices(devices); err != nil {
-		log.Printf("Failed to save devices: %v", err)
+		slog.Error("Failed to batch save devices", "count", len(devices), "error", err)
 	}
 }
 
@@ -164,14 +177,40 @@ func (e *Engine) recordEvent(typ, deviceID, message string) {
 	})
 }
 
-// GetDevices returns all tracked devices sorted by IP address.
+// SetActiveNetwork updates which LAN inventory is visible. Call when Wi‑Fi/network changes.
+func (e *Engine) SetActiveNetwork(info *network.Info) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setActiveNetworkLocked(info)
+}
+
+func (e *Engine) setActiveNetworkLocked(info *network.Info) {
+	prev := e.activeNetworkKey
+	e.activeNetworkKey = NetworkKeyFromInfo(info)
+	e.activeSubnetCIDR = ""
+	if info != nil {
+		e.activeSubnetCIDR = info.SubnetCIDR
+	}
+	if prev != "" && e.activeNetworkKey != "" && prev != e.activeNetworkKey {
+		// Drop miss counters for the previous LAN; they are not offline on this network.
+		for id, dev := range e.devices {
+			if dev.NetworkKey == prev {
+				e.missCount[id] = 0
+			}
+		}
+	}
+}
+
+// GetDevices returns devices for the active network only, sorted by IP.
 func (e *Engine) GetDevices() []Device {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
 	var list []Device
 	for _, dev := range e.devices {
-		list = append(list, *dev)
+		if e.deviceVisibleLocked(dev) {
+			list = append(list, *dev)
+		}
 	}
 
 	sort.Slice(list, func(i, j int) bool {
@@ -179,6 +218,25 @@ func (e *Engine) GetDevices() []Device {
 	})
 
 	return list
+}
+
+// deviceVisibleLocked reports whether a device belongs in the current network view.
+func (e *Engine) deviceVisibleLocked(dev *Device) bool {
+	if e.activeNetworkKey == "" {
+		return true
+	}
+	if dev.NetworkKey == e.activeNetworkKey {
+		return true
+	}
+	// Legacy rows (pre-network-key): show only if IP is on the active subnet.
+	if dev.NetworkKey == "" && ipInCIDR(dev.IP, e.activeSubnetCIDR) {
+		return true
+	}
+	return false
+}
+
+func (e *Engine) belongsToActiveNetworkLocked(dev *Device) bool {
+	return e.deviceVisibleLocked(dev)
 }
 
 // GetDevice returns a device by stable ID.
@@ -403,7 +461,7 @@ func (e *Engine) TryStartPortScan(ctx context.Context, id, mode string) (started
 	go func() {
 		defer e.endPortScan(id)
 		if _, err := e.runPortScan(ctx, id, mode); err != nil {
-			log.Printf("port scan %s (%s): %v", id, mode, err)
+			slog.Error("port scan failed", "id", id, "mode", mode, "error", err)
 			e.emitEvent("portscan_error", map[string]interface{}{
 				"id":    id,
 				"mode":  mode,
@@ -513,9 +571,24 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 	}()
 
 	e.emitEvent("scan_start", map[string]string{
-		"subnet": netInfo.SubnetCIDR,
-		"ssid":   netInfo.SSID,
+		"subnet":      netInfo.SubnetCIDR,
+		"ssid":        netInfo.SSID,
+		"network_key": NetworkKeyFromInfo(netInfo),
 	})
+
+	e.mu.Lock()
+	prevKey := e.activeNetworkKey
+	e.setActiveNetworkLocked(netInfo)
+	netChanged := prevKey != "" && prevKey != e.activeNetworkKey
+	e.mu.Unlock()
+	if netChanged {
+		e.emitEvent("network_changed", map[string]interface{}{
+			"network_key": NetworkKeyFromInfo(netInfo),
+			"ssid":        netInfo.SSID,
+			"subnet":      netInfo.SubnetCIDR,
+			"devices":     e.GetDevices(),
+		})
+	}
 
 	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, func(current, total int) {
 		e.emitEvent("scan_progress", map[string]int{
@@ -590,6 +663,8 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 	finalList := e.GetDevices()
 	e.emitEvent("scan_complete", map[string]interface{}{
 		"total_devices": len(finalList),
+		"devices":       finalList,
+		"network_key":   NetworkKeyFromInfo(netInfo),
 		"timestamp":     now.Format(time.RFC3339),
 	})
 
@@ -598,11 +673,15 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 
 // applyMisses increments miss counters for devices absent from this scan and
 // marks them offline only after offlineMissThreshold consecutive misses.
+// Devices on other networks are ignored (they are not offline — just not here).
 func (e *Engine) applyMisses(seenIDs, wasOnline map[string]bool) (wentOffline, toPersist []Device) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	for id, dev := range e.devices {
+		if !e.belongsToActiveNetworkLocked(dev) {
+			continue
+		}
 		if seenIDs[id] {
 			e.missCount[id] = 0
 			toPersist = append(toPersist, *dev)
@@ -625,14 +704,16 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	private := IsPrivateMAC(normMAC)
 
 	e.mu.Lock()
+	netKey := e.activeNetworkKey
 
 	existing, found, previousMAC := e.findDeviceLocked(normMAC, raw.IP, details.Hostname)
 
 	if !found {
-		id := DeviceID(normMAC, raw.IP)
+		desiredID := ScopedDeviceID(netKey, normMAC, raw.IP)
 		host, src := mdns.PreferHostname("", mdns.NameSourceNone, details.Hostname, details.NameSource)
 		newDev := &Device{
-			ID:           id,
+			ID:           desiredID,
+			NetworkKey:   netKey,
 			IP:           raw.IP,
 			MAC:          normMAC,
 			Vendor:       macVendor,
@@ -648,8 +729,8 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 			FirstSeen:    now,
 			LastSeen:     now,
 		}
-		e.devices[id] = newDev
-		e.missCount[id] = 0
+		e.devices[desiredID] = newDev
+		e.missCount[desiredID] = 0
 		out := *newDev
 		e.mu.Unlock()
 
@@ -661,7 +742,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		if out.Hostname == "" {
 			go e.backgroundNameResolve(out.ID)
 		}
-		return id
+		return desiredID
 	}
 
 	oldID := existing.ID
@@ -675,6 +756,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	existing.LastSeen = now
 	existing.LatencyMs = raw.LatencyMs
 	existing.IP = raw.IP
+	existing.NetworkKey = netKey
 
 	if normMAC != "" {
 		if existing.MAC != "" && existing.MAC != normMAC {
@@ -686,16 +768,23 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		existing.MAC = normMAC
 		existing.IsPrivateMAC = private
 		existing.Vendor = macVendor
+	}
 
-		if strings.HasPrefix(existing.ID, "ip:") {
-			newID := DeviceID(normMAC, raw.IP)
-			if newID != "" && newID != existing.ID {
-				delete(e.devices, existing.ID)
-				delete(e.missCount, existing.ID)
-				existing.ID = newID
-				e.devices[newID] = existing
-			}
-		}
+	// Remount ID when adding network scope or upgrading ip:→MAC; keep base ID
+	// stable across private-MAC rotation.
+	base := stripNetworkScope(existing.ID)
+	if strings.HasPrefix(base, "ip:") && normMAC != "" {
+		base = DeviceID(normMAC, "")
+	}
+	desiredID := base
+	if netKey != "" {
+		desiredID = netKey + "/" + base
+	}
+	if desiredID != "" && desiredID != existing.ID {
+		delete(e.devices, existing.ID)
+		delete(e.missCount, existing.ID)
+		existing.ID = desiredID
+		e.devices[desiredID] = existing
 	}
 
 	if details.Hostname != "" || details.NameSource != "" {
@@ -721,8 +810,15 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	}
 
 	out := *existing
+	migratedFrom := ""
+	if oldID != existing.ID {
+		migratedFrom = oldID
+	}
 	e.mu.Unlock()
 
+	if migratedFrom != "" {
+		e.deletePersisted(migratedFrom)
+	}
 	if !e.isScanning {
 		e.persistDevice(out)
 	}
@@ -737,13 +833,26 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 }
 
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.
-// Must be called with e.mu held.
+// Only matches devices on the active network (or legacy unscoped rows). Must hold e.mu.
 func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, found bool, previousMAC string) {
+	netKey := e.activeNetworkKey
+
 	if normMAC != "" {
+		if id := ScopedDeviceID(netKey, normMAC, ""); id != "" {
+			if d, ok := e.devices[id]; ok {
+				return d, true, ""
+			}
+		}
+		// Legacy unscoped MAC key from before network scoping.
 		if d, ok := e.devices[DeviceID(normMAC, "")]; ok {
-			return d, true, ""
+			if d.NetworkKey == "" || d.NetworkKey == netKey {
+				return d, true, ""
+			}
 		}
 		for _, d := range e.devices {
+			if !e.sameNetworkLocked(d) {
+				continue
+			}
 			if d.MAC != "" && d.MAC == normMAC {
 				return d, true, ""
 			}
@@ -756,10 +865,20 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 	}
 
 	if ip != "" {
+		if id := ScopedDeviceID(netKey, "", ip); id != "" {
+			if d, ok := e.devices[id]; ok {
+				return d, true, ""
+			}
+		}
 		if d, ok := e.devices[DeviceID("", ip)]; ok {
-			return d, true, ""
+			if d.NetworkKey == "" || d.NetworkKey == netKey {
+				return d, true, ""
+			}
 		}
 		for _, d := range e.devices {
+			if !e.sameNetworkLocked(d) {
+				continue
+			}
 			if d.IP == ip {
 				return d, true, ""
 			}
@@ -770,6 +889,9 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 		want := strings.ToLower(strings.TrimSpace(hostname))
 		if !isGenericHostname(want) {
 			for _, d := range e.devices {
+				if !e.sameNetworkLocked(d) {
+					continue
+				}
 				if d.Hostname == "" {
 					continue
 				}
@@ -781,6 +903,19 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 	}
 
 	return nil, false, ""
+}
+
+func (e *Engine) sameNetworkLocked(d *Device) bool {
+	if e.activeNetworkKey == "" {
+		return true
+	}
+	if d.NetworkKey == e.activeNetworkKey {
+		return true
+	}
+	if d.NetworkKey == "" {
+		return true // legacy — allow merge then stamp network key
+	}
+	return false
 }
 
 func isGenericHostname(hostname string) bool {
@@ -807,30 +942,10 @@ func appendUniqueMAC(list []string, mac string) []string {
 }
 
 func compareIPs(ip1, ip2 string) bool {
-	p1 := strings.Split(ip1, ".")
-	p2 := strings.Split(ip2, ".")
-	if len(p1) != 4 || len(p2) != 4 {
-		return ip1 < ip2
+	a1, err1 := netip.ParseAddr(ip1)
+	a2, err2 := netip.ParseAddr(ip2)
+	if err1 == nil && err2 == nil {
+		return a1.Compare(a2) < 0
 	}
-	for i := 0; i < 4; i++ {
-		var n1, n2 int
-		_, _ = parseDec(p1[i], &n1)
-		_, _ = parseDec(p2[i], &n2)
-		if n1 != n2 {
-			return n1 < n2
-		}
-	}
-	return false
-}
-
-func parseDec(s string, out *int) (bool, error) {
-	n := 0
-	for _, ch := range s {
-		if ch < '0' || ch > '9' {
-			return false, nil
-		}
-		n = n*10 + int(ch-'0')
-	}
-	*out = n
-	return true, nil
+	return ip1 < ip2
 }

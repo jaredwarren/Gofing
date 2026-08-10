@@ -210,9 +210,20 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    eventSource.addEventListener('scan_start', () => {
+    eventSource.addEventListener('scan_start', (e) => {
       setScanningState(true);
       showProgress(0);
+      try {
+        const data = JSON.parse(e.data);
+        if (data.network_key) {
+          // Network may have changed; clear stale rows until scan_complete replaces inventory.
+        }
+      } catch (_) { /* ignore */ }
+    });
+
+    eventSource.addEventListener('network_changed', (e) => {
+      const data = JSON.parse(e.data);
+      replaceInventory(data.devices || []);
     });
 
     eventSource.addEventListener('scan_progress', (e) => {
@@ -260,10 +271,29 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    eventSource.addEventListener('scan_complete', () => {
+    eventSource.addEventListener('scan_complete', (e) => {
       setScanningState(false);
       hideProgress();
+      try {
+        const data = JSON.parse(e.data);
+        if (Array.isArray(data.devices)) {
+          replaceInventory(data.devices);
+        }
+      } catch (_) { /* ignore */ }
     });
+  }
+
+  function replaceInventory(list) {
+    devicesMap.clear();
+    (list || []).forEach(upsertDevice);
+    updateCategoryPills();
+    renderTable();
+    updateMetrics();
+    if (openDeviceId && !devicesMap.has(openDeviceId)) {
+      closeDrawer();
+    } else if (openDeviceId) {
+      fillDrawer(devicesMap.get(openDeviceId));
+    }
   }
 
   function triggerScan() {
