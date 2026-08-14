@@ -1,7 +1,7 @@
 .PHONY: build run test clean
 
 build:
-	go build -o gofing .
+	go build -o gofing main.go
 
 run: build
 	./gofing -port 8080

@@ -12,6 +12,12 @@ func TestNameSourceRank(t *testing.T) {
 	if NameSourceRank(NameSourceNone) != 0 {
 		t.Fatal("none should be 0")
 	}
+	if NameSourceRank(NameSourceDHCP) <= NameSourceRank(NameSourceARP) {
+		t.Fatal("DHCP should outrank ARP")
+	}
+	if NameSourceRank(NameSourceHost) <= NameSourceRank(NameSourceDHCP) {
+		t.Fatal("host should outrank DHCP")
+	}
 }
 
 func TestPreferHostnameUpgradeOnly(t *testing.T) {
@@ -49,5 +55,10 @@ func TestPreferHostnameUpgradeOnly(t *testing.T) {
 	name, src = PreferHostname("amys-mbp", NameSourceARP, "���$�", NameSourceDNS)
 	if name != "amys-mbp" || src != NameSourceARP {
 		t.Fatalf("garbage candidate: got %q/%q", name, src)
+	}
+
+	name, src = PreferHostname("", NameSourceNone, "Amys-new-iPhone.local.", NameSourceARP)
+	if name != "Amys-new-iPhone" || src != NameSourceARP {
+		t.Fatalf(".local strip: got %q/%q", name, src)
 	}
 }

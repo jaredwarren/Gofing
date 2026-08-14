@@ -1,6 +1,9 @@
 # Ignore binary
 gofing
 
+# Local DHCP export (home MACs / IPs / hostnames)
+sample.log
+
 # Ignore persistent disk cache
 mac_cache.json
 

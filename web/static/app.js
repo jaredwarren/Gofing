@@ -140,6 +140,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function formatNameSource(src) {
     switch (src) {
       case 'host': return 'This Mac';
+      case 'dhcp': return 'Router DHCP';
       case 'arp': return 'Bonjour / ARP';
       case 'dns': return 'DNS';
       case 'cast': return 'Cast';

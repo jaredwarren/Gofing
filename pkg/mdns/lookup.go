@@ -29,7 +29,7 @@ type cachedName struct {
 }
 
 func (r *Resolver) rememberIPName(ip, hostname, source string) {
-	hostname = SanitizeHostname(hostname)
+	hostname = normalizeResolvedName(hostname)
 	if hostname == "" || ip == "" {
 		return
 	}
@@ -46,6 +46,12 @@ func (r *Resolver) cachedForIP(ip string) cachedName {
 	return r.ipNames[ip]
 }
 
+// CachedName returns the best Bonjour/DNS name previously learned for ip.
+func (r *Resolver) CachedName(ip string) (hostname, source string) {
+	c := r.cachedForIP(ip)
+	return c.Hostname, c.Source
+}
+
 // LookupHostnameDeep aggressively resolves a Bonjour/DNS name for ip.
 // Intended for on-demand "Resolve name" actions (longer timeouts + retries).
 func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
@@ -53,7 +59,7 @@ func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
 	bestName, bestSrc := "", NameSourceNone
 
 	consider := func(name, source string) {
-		name = SanitizeHostname(name)
+		name = normalizeResolvedName(name)
 		if name == "" {
 			return
 		}

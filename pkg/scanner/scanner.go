@@ -37,9 +37,6 @@ func New() *Scanner {
 // PerformScan executes a ping sweep across the subnet, then uses the ARP table
 // only to enrich MAC addresses. A host is considered present only if it
 // responded to a reachability probe — stale ARP cache entries alone are not
-// PerformScan executes a ping sweep across the subnet, then uses the ARP table
-// only to enrich MAC addresses. A host is considered present only if it
-// responded to a reachability probe — stale ARP cache entries alone are not
 // enough (macOS retains ARP rows for minutes after a device disconnects).
 func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
 	if ctx == nil {

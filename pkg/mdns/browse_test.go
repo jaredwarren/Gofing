@@ -16,6 +16,44 @@ func TestParseReachedAtIP(t *testing.T) {
 	}
 }
 
+func TestParseBrowseAddInstance(t *testing.T) {
+	tests := []struct {
+		line string
+		want string
+	}{
+		{
+			line: `18:13:44.894  Add        3  14 local.               _companion-link._tcp. iPad (73)`,
+			want: "iPad (73)",
+		},
+		{
+			line: `18:13:44.894  Add        3  14 local.               _companion-link._tcp. Jared’s MacBook Pro  M4`,
+			want: "Jared’s MacBook Pro M4",
+		},
+		{
+			line: `18:14:45.693  Add        2  14 local.               _workstation._tcp.   calendar [2c:cf:67:2d:ae:b4]`,
+			want: "calendar [2c:cf:67:2d:ae:b4]",
+		},
+		{
+			line: `18:13:44.894  Add        2  14 local.               _companion-link._tcp. iPad (89)`,
+			want: "iPad (89)",
+		},
+		{
+			line: `Timestamp     A/R    Flags  if Domain               Service Type         Instance Name`,
+			want: "",
+		},
+		{
+			line: `18:13:44.894  ...STARTING...`,
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		got := parseBrowseAddInstance(tt.line)
+		if got != tt.want {
+			t.Errorf("parseBrowseAddInstance(%q)\n got %q\nwant %q", tt.line, got, tt.want)
+		}
+	}
+}
+
 func TestRememberIPNameUpgrade(t *testing.T) {
 	r := &Resolver{mdnsCache: map[string]string{}, ipNames: map[string]cachedName{}, ipHints: map[string]FingerprintHints{}}
 	r.rememberIPName("192.168.0.142", "Router Admin", NameSourceHTTP)

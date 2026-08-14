@@ -15,6 +15,7 @@ var browseServiceTypes = []string{
 	"_companion-link._tcp",
 	"_airplay._tcp",
 	"_raop._tcp",
+	"_apple-mobdev2._tcp",
 	"_device-info._tcp",
 	"_rdlink._tcp",
 	"_hap._tcp",
@@ -82,22 +83,8 @@ func (r *Resolver) browseServiceInstances(serviceType string, timeout time.Durat
 	seen := make(map[string]bool)
 	var instances []string
 	for _, line := range strings.Split(out.String(), "\n") {
-		line = strings.TrimSpace(line)
-		fields := strings.Fields(line)
-		addIdx := -1
-		for i, f := range fields {
-			if f == "Add" {
-				addIdx = i
-				break
-			}
-		}
-		if addIdx < 0 || len(fields) < addIdx+5 {
-			continue
-		}
-		// dns-sd -B columns: TIMESTAMP Add Flags If Domain ServiceType Instance...
-		instance := strings.Join(fields[addIdx+4:], " ")
-		instance = strings.TrimSpace(instance)
-		if instance == "" || strings.HasPrefix(instance, "DNSService") {
+		instance := parseBrowseAddInstance(line)
+		if instance == "" {
 			continue
 		}
 		key := strings.ToLower(instance)
@@ -112,6 +99,35 @@ func (r *Resolver) browseServiceInstances(serviceType string, timeout time.Durat
 		r.cacheMu.Unlock()
 	}
 	return instances
+}
+
+// parseBrowseAddInstance extracts the Bonjour instance name from a dns-sd -B line.
+//
+// Columns: TIMESTAMP Add Flags If Domain ServiceType Instance Name...
+// A previous off-by-one treated ServiceType as the start of the instance, so
+// lookups became `dns-sd -L "_companion-link._tcp. iPad (73)"` and always failed.
+func parseBrowseAddInstance(line string) string {
+	fields := strings.Fields(strings.TrimSpace(line))
+	addIdx := -1
+	for i, f := range fields {
+		if f == "Add" {
+			addIdx = i
+			break
+		}
+	}
+	if addIdx < 0 || len(fields) < addIdx+6 {
+		return ""
+	}
+	// Add, Flags, If, Domain, ServiceType, Instance...
+	start := addIdx + 5
+	if !strings.HasPrefix(fields[addIdx+4], "_") {
+		start = addIdx + 4
+	}
+	instance := strings.TrimSpace(strings.Join(fields[start:], " "))
+	if instance == "" || strings.HasPrefix(instance, "DNSService") {
+		return ""
+	}
+	return instance
 }
 
 func lookupServiceHostname(instance, serviceType string, timeout time.Duration) string {

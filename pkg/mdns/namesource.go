@@ -5,6 +5,7 @@ package mdns
 const (
 	NameSourceNone = ""
 	NameSourceHost = "host" // this Mac's computer name
+	NameSourceDHCP = "dhcp" // router DHCP client list
 	NameSourceARP  = "arp"  // macOS arp -a / Bonjour cache
 	NameSourceDNS  = "dns"  // reverse DNS or dns-sd PTR
 	NameSourceCast = "cast" // Chromecast / Nest eureka name
@@ -16,6 +17,8 @@ func NameSourceRank(src string) int {
 	switch src {
 	case NameSourceHost:
 		return 90
+	case NameSourceDHCP:
+		return 85
 	case NameSourceARP:
 		return 80
 	case NameSourceDNS:
@@ -33,8 +36,8 @@ func NameSourceRank(src string) int {
 // Lower-ranked candidates never overwrite a higher-ranked stored name.
 // Equal rank keeps the existing name (avoids flap between equivalent sources).
 func PreferHostname(existingName, existingSource, candidateName, candidateSource string) (name, source string) {
-	candidateName = SanitizeHostname(candidateName)
-	existingName = SanitizeHostname(existingName)
+	candidateName = normalizeResolvedName(candidateName)
+	existingName = normalizeResolvedName(existingName)
 
 	if existingName == "" {
 		existingSource = NameSourceNone

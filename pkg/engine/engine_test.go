@@ -309,6 +309,31 @@ func TestTryStartPortScanRejectsDuplicate(t *testing.T) {
 	eng.endPortScan("00:11:22:33:44:77")
 }
 
+func TestApplyCachedHostnames(t *testing.T) {
+	eng := New(nil)
+	now := time.Now()
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.51", MAC: "70:22:FE:B6:3D:94"}, mdns.DeviceDetails{
+		DeviceType: "Mobile Phone",
+	}, "Apple, Inc.", now, nil)
+
+	dev, ok := eng.GetDevice("70:22:FE:B6:3D:94")
+	if !ok || dev.Hostname != "" {
+		t.Fatalf("expected empty hostname, got ok=%v hostname=%q", ok, dev.Hostname)
+	}
+
+	// Background browse learns the Bonjour name after the device was fingerprinted.
+	_ = eng.mdnsResolver.ResolveDevice("192.168.0.51", "70:22:FE:B6:3D:94", "Apple, Inc.", false, "", "Amys-new-iPhone.local")
+	eng.applyCachedHostnames()
+
+	dev, _ = eng.GetDevice("70:22:FE:B6:3D:94")
+	if dev.Hostname != "Amys-new-iPhone" {
+		t.Fatalf("cached hostname not applied: %q", dev.Hostname)
+	}
+	if dev.NameSource != mdns.NameSourceARP {
+		t.Fatalf("source=%q", dev.NameSource)
+	}
+}
+
 func TestHostnameRankUpgradeInEngine(t *testing.T) {
 	eng := New(nil)
 	now := time.Now()

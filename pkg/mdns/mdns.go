@@ -116,12 +116,20 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 		}
 	}
 
-	// Priority 3: Reverse DNS / dns-sd PTR (moderate timeout during scans)
 	// Priority 3: Reverse DNS / dns-sd PTR (quick timeout during scans)
 	if hostname == "" {
 		if h, src := r.LookupHostnameQuick(ip); h != "" {
 			hostname = h
 			nameSource = src
+		}
+	}
+
+	// Priority 4: NetBIOS (Windows PCs) — cheap UDP probe, last resort
+	if hostname == "" {
+		if nbName := queryNetBIOSName(ip); nbName != "" {
+			hostname = nbName
+			nameSource = NameSourceARP
+			r.rememberIPName(ip, hostname, NameSourceARP)
 		}
 	}
 

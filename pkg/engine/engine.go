@@ -111,7 +111,7 @@ func (e *Engine) loadFromStore() {
 		if d.ID == "" {
 			d.ID = DeviceID(d.MAC, d.IP)
 		}
-		d.Hostname = mdns.SanitizeHostname(d.Hostname)
+		d.Hostname, d.NameSource = mdns.PreferHostname("", mdns.NameSourceNone, d.Hostname, d.NameSource)
 		if d.Hostname == "" {
 			d.NameSource = mdns.NameSourceNone
 		}
@@ -306,7 +306,7 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 	bestName, bestSrc := "", mdns.NameSourceNone
 
 	consider := func(name, source string) {
-		name = mdns.SanitizeHostname(name)
+		name, source = mdns.PreferHostname("", mdns.NameSourceNone, name, source)
 		if name == "" {
 			return
 		}
@@ -648,6 +648,11 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 
 	wg.Wait()
 
+	// Browse runs in the background during the ping sweep. Apply any names
+	// learned after a device was fingerprinted so the first scan still
+	// gets Bonjour hostnames (macOS arp -a almost never has them).
+	e.applyCachedHostnames()
+
 	// Apply offline debounce for devices not seen this scan.
 	wentOffline, toPersist := e.applyMisses(seenIDs, wasOnline)
 
@@ -669,6 +674,27 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 	})
 
 	return finalList, nil
+}
+
+// applyCachedHostnames upgrades in-memory hostnames from the background mDNS
+// browse cache. macOS `arp -a` returns "?" for nearly every host, so Bonjour
+// names often arrive only after fingerprinting has already run.
+func (e *Engine) applyCachedHostnames() {
+	if e.mdnsResolver == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, d := range e.devices {
+		if d.IP == "" {
+			continue
+		}
+		name, src := e.mdnsResolver.CachedName(d.IP)
+		if name == "" {
+			continue
+		}
+		d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, name, src)
+	}
 }
 
 // applyMisses increments miss counters for devices absent from this scan and
