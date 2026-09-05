@@ -63,9 +63,9 @@ func TestSanitizeHostname(t *testing.T) {
 		{"AMYS-MBP", "AMYS-MBP"},
 		{"Jared's MacBook", "Jared's MacBook"},
 		{"AMYS-MBP.local", "AMYS-MBP.local"},
-		{"\x80\x94\x00\x01$", ""},          // NetBIOS-ish binary garbage
+		{"\x80\x94\x00\x01$", ""}, // NetBIOS-ish binary garbage
 		{"\x00\x01\x02", ""},
-		{"���$�", ""},                     // replacement-char junk
+		{"���$�", ""}, // replacement-char junk
 		{"$", ""},
 		{"A", ""}, // too short / not enough alnum
 		{"", ""},

@@ -8,7 +8,8 @@ macOS-native local network discovery and device diagnostics — a Fing-like tool
 
 ```bash
 make build    # go build -o gofing .
-make run      # ./gofing -port 8080
+make run              # ./gofing -port 8080
+make run PORT=8081    # if 8080 is already in use
 make test     # go test -v ./...
 ```
 
@@ -28,6 +29,9 @@ Flags:
 | `-interval` | `30s` | Background subnet rescan interval |
 | `-open` | `true` | Open the browser on startup |
 | `-data-dir` | Application Support | Directory for `gofing.db` / caches |
+| `-dhcp-file` | `<data-dir>/dhcp-clients.txt` | Poll this DHCP client-list export (created if you save one there) |
+| `-dhcp-url` | empty | HTTP GET of JSON or client-list text to poll |
+| `-dhcp-interval` | `60s` | How often to re-read DHCP leases |
 
 ## Data directory
 
@@ -41,6 +45,7 @@ Persistent data lives under:
 |---|---|
 | `gofing.db` | BoltDB device inventory, events, settings (`pkg/store`) |
 | `oui_cache.json` | OUI vendor lookup cache (`pkg/oui`) |
+| `dhcp-clients.txt` | Optional DHCP client-list export, polled automatically |
 
 ## Roadmap
 

@@ -17,9 +17,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const searchInput = document.getElementById('searchInput');
   const rescanBtn = document.getElementById('rescanBtn');
   const scanBtnText = document.getElementById('scanBtnText');
+  const dhcpImportBtn = document.getElementById('dhcpImportBtn');
+  const dhcpFileInput = document.getElementById('dhcpFileInput');
   const progressContainer = document.getElementById('progressContainer');
   const progressBarFill = document.getElementById('progressBarFill');
   const categoryPillsContainer = document.getElementById('categoryPills');
+  const activityFeed = document.getElementById('activityFeed');
+  const alertsEnabledChk = document.getElementById('alertsEnabledChk');
+  const notifyMacosChk = document.getElementById('notifyMacosChk');
 
   const deviceDrawer = document.getElementById('deviceDrawer');
   const drawerCloseBtn = document.getElementById('drawerCloseBtn');
@@ -79,6 +84,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   fetchNetworkInfo();
   fetchInitialDevices();
+  fetchActivity();
+  fetchSettings();
   initSSE();
 
   searchInput.addEventListener('input', (e) => {
@@ -97,6 +104,29 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   rescanBtn.addEventListener('click', () => triggerScan());
+  dhcpImportBtn.addEventListener('click', () => dhcpFileInput.click());
+  dhcpFileInput.addEventListener('change', async () => {
+    const file = dhcpFileInput.files && dhcpFileInput.files[0];
+    dhcpFileInput.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = await fetch('/api/dhcp/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: text
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        alert(data.message || 'DHCP import failed — paste a client list with names, MACs, and IPs.');
+        return;
+      }
+      dhcpImportBtn.title = `Imported ${data.created || 0} new, ${data.updated || 0} updated`;
+    } catch (err) {
+      console.error('DHCP import error', err);
+      alert('DHCP import failed');
+    }
+  });
 
   drawerCloseBtn.addEventListener('click', closeDrawer);
   deviceDrawer.addEventListener('click', (e) => {
@@ -142,6 +172,7 @@ document.addEventListener('DOMContentLoaded', () => {
       case 'host': return 'This Mac';
       case 'dhcp': return 'Router DHCP';
       case 'arp': return 'Bonjour / ARP';
+      case 'mdns': return 'Bonjour';
       case 'dns': return 'DNS';
       case 'cast': return 'Cast';
       case 'http': return 'HTTP title';
@@ -197,6 +228,89 @@ document.addEventListener('DOMContentLoaded', () => {
       .catch(err => console.error('Failed to fetch initial devices:', err));
   }
 
+  const ACTIVITY_MAX = 100;
+  const FEED_TYPES = new Set(['alert', 'online', 'offline', 'found']);
+  const recentFeedAt = new Map();
+
+  function formatFeedTime(isoStr) {
+    if (!isoStr) return '';
+    try {
+      return new Date(isoStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch {
+      return '';
+    }
+  }
+
+  function activityItemHTML(ev) {
+    const typ = ev.type || ev.rule || 'event';
+    const isAlert = typ === 'alert' || !!ev.rule;
+    return `<li class="activity-item${isAlert ? ' alert' : ''}" data-type="${escapeHtml(typ)}">
+      <span class="act-time">${escapeHtml(formatFeedTime(ev.timestamp))}</span>
+      <span class="act-msg">${escapeHtml(ev.message || '')}</span>
+    </li>`;
+  }
+
+  function prependActivity(ev) {
+    if (!activityFeed || !ev || !ev.message) return;
+    const key = ev.device_id || ev.message;
+    const now = Date.now();
+    const prev = recentFeedAt.get(key);
+    if (prev && now - prev < 2000) return;
+    recentFeedAt.set(key, now);
+
+    const empty = activityFeed.querySelector('.activity-empty');
+    if (empty) empty.remove();
+    activityFeed.insertAdjacentHTML('afterbegin', activityItemHTML(ev));
+    while (activityFeed.children.length > ACTIVITY_MAX) {
+      activityFeed.removeChild(activityFeed.lastElementChild);
+    }
+  }
+
+  function renderActivity(events) {
+    const list = (events || []).filter(ev => FEED_TYPES.has(ev.type));
+    if (!list.length) {
+      activityFeed.innerHTML = '<li class="activity-empty">No recent activity</li>';
+      return;
+    }
+    activityFeed.innerHTML = list.slice(0, ACTIVITY_MAX).map(activityItemHTML).join('');
+  }
+
+  function fetchActivity() {
+    fetch('/api/events/history?limit=100')
+      .then(res => res.json())
+      .then(data => renderActivity(data.events || []))
+      .catch(err => console.error('Failed to fetch activity:', err));
+  }
+
+  function fetchSettings() {
+    fetch('/api/settings')
+      .then(res => res.json())
+      .then(s => {
+        if (alertsEnabledChk) alertsEnabledChk.checked = !!s.alerts_enabled;
+        if (notifyMacosChk) notifyMacosChk.checked = !!s.notify_macos;
+      })
+      .catch(err => console.error('Failed to fetch settings:', err));
+  }
+
+  function patchSettings(body) {
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).catch(err => console.error('Failed to update settings:', err));
+  }
+
+  if (alertsEnabledChk) {
+    alertsEnabledChk.addEventListener('change', () => {
+      patchSettings({ alerts_enabled: alertsEnabledChk.checked });
+    });
+  }
+  if (notifyMacosChk) {
+    notifyMacosChk.addEventListener('change', () => {
+      patchSettings({ notify_macos: notifyMacosChk.checked });
+    });
+  }
+
   function initSSE() {
     const eventSource = new EventSource('/api/events');
 
@@ -234,18 +348,68 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const onDeviceEvent = (e) => {
       const dev = JSON.parse(e.data);
+      const id = deviceKey(dev);
+      const prev = devicesMap.get(id);
+      const cameOnline = prev && !prev.is_online && !!dev.is_online;
       upsertDevice(dev);
       updateCategoryPills();
       renderTable();
       updateMetrics();
-      if (openDeviceId && deviceKey(dev) === openDeviceId) {
+      if (openDeviceId && id === openDeviceId) {
         fillDrawer(dev);
+      }
+      if (cameOnline && !(alertsEnabledChk && alertsEnabledChk.checked)) {
+        prependActivity({
+          type: 'online',
+          device_id: id,
+          message: `${displayName(dev)} is online`,
+          timestamp: new Date().toISOString()
+        });
       }
     };
 
-    eventSource.addEventListener('device_found', onDeviceEvent);
+    eventSource.addEventListener('device_found', (e) => {
+      try {
+        const dev = JSON.parse(e.data);
+        if (!(alertsEnabledChk && alertsEnabledChk.checked)) {
+          prependActivity({
+            type: 'found',
+            device_id: deviceKey(dev),
+            message: `Discovered ${displayName(dev)} (${dev.ip || ''})`,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (_) { /* ignore */ }
+      onDeviceEvent(e);
+    });
     eventSource.addEventListener('device_updated', onDeviceEvent);
-    eventSource.addEventListener('device_offline', onDeviceEvent);
+    eventSource.addEventListener('device_offline', (e) => {
+      try {
+        const dev = JSON.parse(e.data);
+        if (!(alertsEnabledChk && alertsEnabledChk.checked)) {
+          prependActivity({
+            type: 'offline',
+            device_id: deviceKey(dev),
+            message: `${displayName(dev)} went offline`,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (_) { /* ignore */ }
+      onDeviceEvent(e);
+    });
+
+    eventSource.addEventListener('alert', (e) => {
+      try {
+        const a = JSON.parse(e.data);
+        prependActivity({
+          type: 'alert',
+          rule: a.rule,
+          device_id: a.device_id,
+          message: a.message,
+          timestamp: a.timestamp
+        });
+      } catch (_) { /* ignore */ }
+    });
 
     eventSource.addEventListener('portscan_complete', (e) => {
       const data = JSON.parse(e.data);

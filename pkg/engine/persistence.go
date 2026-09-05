@@ -23,6 +23,8 @@ type Persistence interface {
 	DeleteDevice(id string) error
 	AppendEvent(ev Event) error
 	ListEvents(deviceID string, limit int) ([]Event, error)
+	GetSettings() (Settings, error)
+	SetSettings(Settings) error
 }
 
 // DisplayName returns the preferred user-facing name.

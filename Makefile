@@ -1,10 +1,12 @@
 .PHONY: build run test clean
 
+PORT ?= 8080
+
 build:
-	go build -o gofing main.go
+	go build -o gofing .
 
 run: build
-	./gofing -port 8080
+	./gofing -port $(PORT)
 
 test:
 	go test -v ./...

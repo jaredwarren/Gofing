@@ -22,14 +22,8 @@ const (
 // Event is a persisted presence or alert event (alias of engine.Event).
 type Event = engine.Event
 
-// Settings holds user-configurable runtime preferences.
-type Settings struct {
-	ScanIntervalSec    int    `json:"scan_interval_sec"`
-	MonitorIntervalSec int    `json:"monitor_interval_sec"`
-	AlertsEnabled      bool   `json:"alerts_enabled"`
-	NotifymacOS        bool   `json:"notify_macos"`
-	DataDir            string `json:"data_dir,omitempty"`
-}
+// Settings is an alias of engine.Settings.
+type Settings = engine.Settings
 
 // Store is a BoltDB-backed persistence layer.
 type Store struct {
@@ -214,22 +208,19 @@ func (s *Store) ListEvents(deviceID string, limit int) ([]Event, error) {
 
 // GetSettings loads settings, returning defaults when unset.
 func (s *Store) GetSettings() (Settings, error) {
-	defaults := Settings{
-		ScanIntervalSec:    30,
-		MonitorIntervalSec: 10,
-		AlertsEnabled:      true,
-		NotifymacOS:        true,
-		DataDir:            DefaultDataDir(),
-	}
+	defaults := engine.DefaultSettings()
+	defaults.DataDir = DefaultDataDir()
 
 	var loaded Settings
 	var found bool
+	var payload []byte
 	err := s.db.View(func(tx *bbolt.Tx) error {
 		v := tx.Bucket([]byte(bucketSettings)).Get([]byte(settingsKey))
 		if v == nil {
 			return nil
 		}
 		found = true
+		payload = append([]byte(nil), v...)
 		return json.Unmarshal(v, &loaded)
 	})
 	if err != nil {
@@ -246,6 +237,17 @@ func (s *Store) GetSettings() (Settings, error) {
 	}
 	if loaded.DataDir == "" {
 		loaded.DataDir = defaults.DataDir
+	}
+	// Pre-Phase-3 blobs omit these keys; default them on rather than treating
+	// Go's false zero-value as an explicit opt-out.
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(payload, &raw) == nil {
+		if _, ok := raw["alerts_enabled"]; !ok {
+			loaded.AlertsEnabled = defaults.AlertsEnabled
+		}
+		if _, ok := raw["notify_macos"]; !ok {
+			loaded.NotifymacOS = defaults.NotifymacOS
+		}
 	}
 	return loaded, nil
 }

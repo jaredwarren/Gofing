@@ -18,6 +18,12 @@ func TestNameSourceRank(t *testing.T) {
 	if NameSourceRank(NameSourceHost) <= NameSourceRank(NameSourceDHCP) {
 		t.Fatal("host should outrank DHCP")
 	}
+	if NameSourceRank(NameSourceMDNS) != NameSourceRank(NameSourceARP) {
+		t.Fatal("mdns should rank with ARP")
+	}
+	if NameSourceRank(NameSourceDHCP) <= NameSourceRank(NameSourceMDNS) {
+		t.Fatal("DHCP should outrank mDNS")
+	}
 }
 
 func TestPreferHostnameUpgradeOnly(t *testing.T) {
@@ -60,5 +66,11 @@ func TestPreferHostnameUpgradeOnly(t *testing.T) {
 	name, src = PreferHostname("", NameSourceNone, "Amys-new-iPhone.local.", NameSourceARP)
 	if name != "Amys-new-iPhone" || src != NameSourceARP {
 		t.Fatalf(".local strip: got %q/%q", name, src)
+	}
+
+	// DHCP must not be demoted by an mDNS instance/hostname
+	name, src = PreferHostname("Amys-MBP", NameSourceDHCP, "iPad (73)", NameSourceMDNS)
+	if name != "Amys-MBP" || src != NameSourceDHCP {
+		t.Fatalf("mdns must not demote dhcp: got %q/%q", name, src)
 	}
 }

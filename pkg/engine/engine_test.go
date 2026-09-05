@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jaredwarren/Gofing/pkg/dhcp"
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
@@ -234,7 +235,7 @@ func TestScanDevicePortsCommon(t *testing.T) {
 	eng := New(nil)
 	now := time.Now()
 	eng.upsertDevice(scanner.RawDevice{IP: "127.0.0.1", MAC: "00:11:22:33:44:55"}, mdns.DeviceDetails{
-		Hostname: "localhost-test",
+		Hostname:   "localhost-test",
 		NameSource: mdns.NameSourceDNS,
 		DeviceType: "Computer",
 	}, "Unknown", now, nil)
@@ -502,5 +503,90 @@ func TestUpsertPrivateMACGenericHostnameDoesNotMerge(t *testing.T) {
 	devs := eng.GetDevices()
 	if len(devs) != 2 {
 		t.Fatalf("expected 2 distinct devices for generic hostname 'iPhone', got %d", len(devs))
+	}
+}
+
+func TestImportDHCPLeasesCreatesOfflineNamedDevice(t *testing.T) {
+	eng := New(nil)
+	eng.SetActiveNetwork(&network.Info{SSID: "Home", SubnetCIDR: "192.168.0.0/24", GatewayIP: "192.168.0.1"})
+
+	res := eng.ImportDHCPLeases([]dhcp.Lease{{
+		Hostname: "Amys-MBP",
+		MAC:      "8c:85:90:24:10:b7",
+		IP:       "192.168.0.142",
+	}})
+	if res.Created != 1 {
+		t.Fatalf("created=%d %+v", res.Created, res)
+	}
+	dev, ok := eng.GetDevice("ssid:Home/8C:85:90:24:10:B7")
+	if !ok {
+		t.Fatal("device missing")
+	}
+	if dev.Hostname != "Amys-MBP" || dev.NameSource != mdns.NameSourceDHCP {
+		t.Fatalf("hostname=%q source=%q", dev.Hostname, dev.NameSource)
+	}
+	if dev.IsOnline {
+		t.Fatal("DHCP import must not mark devices online")
+	}
+
+	res = eng.ImportDHCPLeases([]dhcp.Lease{{
+		Hostname: "---",
+		MAC:      "AA:BB:CC:DD:EE:01",
+		IP:       "192.168.0.10",
+	}})
+	if res.Skipped == 0 {
+		t.Fatal("unnamed lease should be skipped")
+	}
+}
+
+func TestImportDHCPLeasesDoesNotDemoteHost(t *testing.T) {
+	eng := New(nil)
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.72", MAC: "3A:45:DB:15:44:3D"}, mdns.DeviceDetails{
+		Hostname:   "Jareds-MBP",
+		NameSource: mdns.NameSourceHost,
+	}, "Apple", time.Now(), nil)
+
+	res := eng.ImportDHCPLeases([]dhcp.Lease{{
+		Hostname: "android-dhcp-xyz",
+		MAC:      "3A:45:DB:15:44:3D",
+		IP:       "192.168.0.99",
+	}})
+	if res.Updated != 1 {
+		t.Fatalf("expected IP update, got %+v", res)
+	}
+	dev, _ := eng.GetDevice("3A:45:DB:15:44:3D")
+	if dev.Hostname != "Jareds-MBP" || dev.NameSource != mdns.NameSourceHost {
+		t.Fatalf("host name lost: %q/%q", dev.Hostname, dev.NameSource)
+	}
+	if dev.IP != "192.168.0.99" {
+		t.Fatalf("ip=%q", dev.IP)
+	}
+}
+
+func TestOnNameLearnedAppliesMDNS(t *testing.T) {
+	eng := New(nil)
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.142", MAC: "8C:85:90:24:10:B7"}, mdns.DeviceDetails{
+		DeviceType: "Computer",
+	}, "Apple", time.Now(), nil)
+
+	var events int
+	eng.RegisterEventListener(func(eventType string, data interface{}) {
+		if eventType == "device_updated" {
+			events++
+		}
+	})
+	eng.onNameLearned("192.168.0.142", "Amys-MBP", mdns.NameSourceMDNS)
+	dev, _ := eng.GetDevice("8C:85:90:24:10:B7")
+	if dev.Hostname != "Amys-MBP" || dev.NameSource != mdns.NameSourceMDNS {
+		t.Fatalf("%q/%q", dev.Hostname, dev.NameSource)
+	}
+	if events != 1 {
+		t.Fatalf("events=%d", events)
+	}
+
+	eng.onNameLearned("192.168.0.142", "iPad (73)", mdns.NameSourceMDNS)
+	dev, _ = eng.GetDevice("8C:85:90:24:10:B7")
+	if dev.Hostname != "Amys-MBP" {
+		t.Fatalf("equal-rank flap: %q", dev.Hostname)
 	}
 }

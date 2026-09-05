@@ -1,6 +1,7 @@
 package mdns
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -22,23 +23,36 @@ type DeviceDetails struct {
 	Services   []string `json:"services"`
 }
 
+// NameLearnedFunc is invoked when the always-on listener stores a hostname for an IP.
+type NameLearnedFunc func(ip, hostname, source string)
+
 // Resolver handles hostname resolution and multi-layer device fingerprinting.
 type Resolver struct {
-	mdnsCache   map[string]string           // service instance names
-	ipNames     map[string]cachedName       // IP → best Bonjour/DNS name
-	ipHints     map[string]FingerprintHints // IP → TXT-derived model/type
-	cacheMu     sync.RWMutex
+	mdnsCache map[string]string           // service instance names
+	ipNames   map[string]cachedName       // IP → best Bonjour/DNS name
+	ipHints   map[string]FingerprintHints // IP → TXT-derived model/type
+	cacheMu   sync.RWMutex
+	onLearned NameLearnedFunc
+
+	listenMu     sync.Mutex
+	listenCancel context.CancelFunc
+	listenIface  string
 }
 
-// New returns a new Resolver instance and starts background mDNS discovery.
+// New returns a new Resolver. Call Listen to join mDNS multicast.
 func New() *Resolver {
-	r := &Resolver{
+	return &Resolver{
 		mdnsCache: make(map[string]string),
 		ipNames:   make(map[string]cachedName),
 		ipHints:   make(map[string]FingerprintHints),
 	}
-	go r.backgroundDiscovery()
-	return r
+}
+
+// SetNameLearnedHandler registers a callback for newly cached mDNS hostnames.
+func (r *Resolver) SetNameLearnedHandler(fn NameLearnedFunc) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	r.onLearned = fn
 }
 
 // ResolveDevice performs multi-layer non-blocking fingerprinting.

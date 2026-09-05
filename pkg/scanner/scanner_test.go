@@ -39,28 +39,45 @@ func TestExpandCIDR(t *testing.T) {
 	}
 }
 
-func TestMergeProbeAndARPIgnoresStaleARP(t *testing.T) {
+func TestMergeProbeAndARPIncludesCompleteARP(t *testing.T) {
 	now := time.Now()
 	ping := map[string]float64{
 		"192.168.0.1": 1.2,
 	}
 	arp := map[string]RawDevice{
 		"192.168.0.1":   {IP: "192.168.0.1", MAC: "AA:BB:CC:DD:EE:01", Iface: "en0", Hostname: "router.local"},
-		"192.168.0.132": {IP: "192.168.0.132", MAC: "28:CD:C1:01:43:34", Iface: "en0"}, // stale
+		"192.168.0.132": {IP: "192.168.0.132", MAC: "28:CD:C1:01:43:34", Iface: "en0"}, // ICMP-silent, L2 present
+		"10.8.0.2":      {IP: "10.8.0.2", MAC: "00:11:22:33:44:55", Iface: "utun0"},    // other subnet
 	}
 
-	got := mergeProbeAndARP(ping, arp, now)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 reachable device, got %d: %+v", len(got), got)
+	got := mergeProbeAndARP(ping, arp, "192.168.0.0/24", "en0", now)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 in-subnet devices, got %d: %+v", len(got), got)
 	}
-	if got[0].IP != "192.168.0.1" {
-		t.Fatalf("unexpected IP %q", got[0].IP)
+	byIP := map[string]RawDevice{}
+	for _, d := range got {
+		byIP[d.IP] = d
 	}
-	if got[0].MAC != "AA:BB:CC:DD:EE:01" {
-		t.Fatalf("expected ARP MAC enrichment, got %q", got[0].MAC)
+	router := byIP["192.168.0.1"]
+	if router.MAC != "AA:BB:CC:DD:EE:01" || router.Hostname != "router.local" {
+		t.Fatalf("probe enrichment: %+v", router)
 	}
-	if got[0].Hostname != "router.local" {
-		t.Fatalf("expected ARP hostname enrichment, got %q", got[0].Hostname)
+	silent := byIP["192.168.0.132"]
+	if silent.MAC != "28:CD:C1:01:43:34" || !silent.IsOnline {
+		t.Fatalf("ARP-complete host missing: %+v", silent)
+	}
+	if _, ok := byIP["10.8.0.2"]; ok {
+		t.Fatal("out-of-subnet ARP row should be excluded")
+	}
+}
+
+func TestMergeProbeAndARPSkipsOtherIface(t *testing.T) {
+	arp := map[string]RawDevice{
+		"192.168.0.50": {IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:50", Iface: "en1"},
+	}
+	got := mergeProbeAndARP(nil, arp, "192.168.0.0/24", "en0", time.Now())
+	if len(got) != 0 {
+		t.Fatalf("expected no devices on other iface, got %+v", got)
 	}
 }
 
@@ -112,9 +129,8 @@ func TestParseARPLineWithHostname(t *testing.T) {
 }
 
 func TestMergeProbeAndARPIncludesPingWithoutARP(t *testing.T) {
-	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, map[string]RawDevice{}, time.Now())
+	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, map[string]RawDevice{}, "10.0.0.0/24", "en0", time.Now())
 	if len(got) != 1 || got[0].MAC != "" || !got[0].IsOnline {
 		t.Fatalf("unexpected result: %+v", got)
 	}
 }
-

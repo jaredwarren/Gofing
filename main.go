@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jaredwarren/Gofing/pkg/dhcp"
 	"github.com/jaredwarren/Gofing/pkg/engine"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/server"
@@ -26,6 +27,9 @@ func main() {
 	intervalFlag := flag.Duration("interval", 30*time.Second, "Background network rescan interval")
 	openBrowserFlag := flag.Bool("open", true, "Auto open browser on startup")
 	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
+	dhcpFileFlag := flag.String("dhcp-file", "", "DHCP client-list file to poll (default: <data-dir>/dhcp-clients.txt if present)")
+	dhcpURLFlag := flag.String("dhcp-url", "", "HTTP URL returning DHCP leases as JSON or a client-list export")
+	dhcpIntervalFlag := flag.Duration("dhcp-interval", 60*time.Second, "DHCP lease poll interval")
 	flag.Parse()
 
 	slog.Info("⚡ Starting Gofing Local Network Discovery Service...")
@@ -61,8 +65,14 @@ func main() {
 	defer cancel()
 
 	devEngine := engine.New(db)
-	devEngine.SetActiveNetwork(netInfo)
+	devEngine.Start(ctx, netInfo)
 	slog.Info("📂 Loaded known devices from store", "count", len(devEngine.GetDevices()), "network", engine.NetworkKeyFromInfo(netInfo))
+
+	dhcpFile := *dhcpFileFlag
+	if dhcpFile == "" {
+		dhcpFile = filepath.Join(filepath.Dir(dbPath), "dhcp-clients.txt")
+	}
+	go pollDHCP(ctx, devEngine, dhcp.Source{File: dhcpFile, URL: *dhcpURLFlag}, *dhcpIntervalFlag)
 
 	go func() {
 		slog.Info("🔍 Performing initial subnet scan...")
@@ -131,6 +141,39 @@ func main() {
 		slog.Warn("⚠️ HTTP shutdown error", "error", err)
 	}
 	slog.Info("👋 Store closed. Shutdown complete.")
+}
+
+func pollDHCP(ctx context.Context, eng *engine.Engine, src dhcp.Source, interval time.Duration) {
+	run := func() {
+		leases, err := src.Fetch(ctx)
+		if err != nil {
+			slog.Warn("DHCP poll failed", "error", err)
+			return
+		}
+		if len(leases) == 0 {
+			return
+		}
+		res := eng.ImportDHCPLeases(leases)
+		if res.Created == 0 && res.Updated == 0 {
+			return
+		}
+		slog.Info("DHCP leases imported", "parsed", len(leases), "created", res.Created, "updated", res.Updated, "skipped", res.Skipped)
+	}
+
+	run()
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func openBrowser(url string) {

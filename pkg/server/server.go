@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jaredwarren/Gofing/pkg/dhcp"
 	"github.com/jaredwarren/Gofing/pkg/engine"
 	"github.com/jaredwarren/Gofing/pkg/network"
 )
@@ -47,6 +48,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/devices", s.handleDevicesRoot)
 	mux.HandleFunc("/api/devices/", s.handleDeviceSubpath)
 	mux.HandleFunc("/api/scan", s.handleTriggerScan)
+	mux.HandleFunc("/api/dhcp/import", s.handleDHCPImport)
+	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/events/history", s.handleEventsHistory)
 	mux.HandleFunc("/api/events", s.handleSSE)
 
 	fileServer := http.FileServer(http.FS(s.staticFS))
@@ -268,6 +272,71 @@ func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
 		"status":  "scan_started",
 		"message": "Subnet discovery scan launched",
 	})
+}
+
+func (s *Server) handleDHCPImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	leases := dhcp.Parse(body)
+	if len(leases) == 0 {
+		http.Error(w, "No DHCP leases found in payload", http.StatusBadRequest)
+		return
+	}
+	res := s.devEngine.ImportDHCPLeases(leases)
+	writeJSON(w, map[string]interface{}{
+		"status":  "ok",
+		"created": res.Created,
+		"updated": res.Updated,
+		"skipped": res.Skipped,
+		"parsed":  len(leases),
+	})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, s.devEngine.GetSettings())
+	case http.MethodPut:
+		var patch engine.SettingsPatch
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&patch); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		out, err := s.devEngine.UpdateSettings(patch)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, out)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleEventsHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 100
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	events, err := s.devEngine.ListEvents("", limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"events": events})
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {

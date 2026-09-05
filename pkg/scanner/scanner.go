@@ -34,11 +34,10 @@ func New() *Scanner {
 	return &Scanner{}
 }
 
-// PerformScan executes a ping sweep across the subnet, then uses the ARP table
-// only to enrich MAC addresses. A host is considered present only if it
-// responded to a reachability probe — stale ARP cache entries alone are not
-// enough (macOS retains ARP rows for minutes after a device disconnects).
-func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
+// PerformScan executes a ping sweep across the subnet, then reads the ARP table.
+// Presence is the union of: hosts that answered ICMP/TCP, and complete in-subnet
+// ARP rows on iface (Layer-2 evidence for devices that ignore ping).
+func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -50,7 +49,7 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR string, progressCb
 	// 1. Fast Ping Sweep across subnet using parallel worker pool
 	pingResults := s.pingSweep(ctx, ips, progressCb)
 
-	// 2. Parse macOS ARP table for MAC enrichment only
+	// 2. Parse macOS ARP table for MAC enrichment and L2-only hosts
 	arpByIP := make(map[string]RawDevice)
 	arpDevices, err := s.parsemacOSARPTable(ctx)
 	if err != nil {
@@ -60,13 +59,17 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR string, progressCb
 		arpByIP[dev.IP] = dev
 	}
 
-	return mergeProbeAndARP(pingResults, arpByIP, time.Now()), nil
+	return mergeProbeAndARP(pingResults, arpByIP, subnetCIDR, iface, time.Now()), nil
 }
 
-// mergeProbeAndARP returns only hosts that answered a probe, enriched with ARP MAC/hostname.
-// ARP-only entries (stale cache) are intentionally excluded.
-func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevice, now time.Time) []RawDevice {
+// mergeProbeAndARP returns probe-responsive hosts plus complete ARP entries that
+// sit on the scanned subnet (and iface, when set). The ping sweep already
+// provoked ARP for every address; a complete row is L2 evidence even when ICMP
+// and TCP are blocked. Stale ARP may linger until the OS expires it.
+func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevice, subnetCIDR, iface string, now time.Time) []RawDevice {
+	seen := make(map[string]bool, len(pingResults)+len(arpByIP))
 	var result []RawDevice
+
 	for ip, lat := range pingResults {
 		dev := RawDevice{
 			IP:        ip,
@@ -79,9 +82,44 @@ func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevi
 			dev.Iface = arp.Iface
 			dev.Hostname = arp.Hostname
 		}
+		seen[ip] = true
 		result = append(result, dev)
 	}
+
+	iface = strings.TrimSpace(iface)
+	for ip, arp := range arpByIP {
+		if seen[ip] {
+			continue
+		}
+		if arp.MAC == "" {
+			continue
+		}
+		if subnetCIDR != "" && !ipInCIDR(ip, subnetCIDR) {
+			continue
+		}
+		if iface != "" && arp.Iface != "" && !strings.EqualFold(arp.Iface, iface) {
+			continue
+		}
+		arp.IsOnline = true
+		arp.LastSeen = now
+		result = append(result, arp)
+	}
 	return result
+}
+
+func ipInCIDR(ipStr, cidr string) bool {
+	if ipStr == "" || cidr == "" {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return false
+	}
+	return network.Contains(ip)
 }
 
 func (s *Scanner) pingSweep(ctx context.Context, ips []string, progressCb func(scanned, total int)) map[string]float64 {
@@ -129,6 +167,14 @@ func (s *Scanner) pingSweep(ctx context.Context, ips []string, progressCb func(s
 
 	wg.Wait()
 	return results
+}
+
+// ProbeIP is a cheap reachability check for a single host (TCP common ports, then ICMP).
+func ProbeIP(ctx context.Context, ip string) (float64, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return pingIPFast(ctx, ip)
 }
 
 func pingIPFast(ctx context.Context, ip string) (float64, bool) {

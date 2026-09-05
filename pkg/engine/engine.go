@@ -13,6 +13,7 @@ import (
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
+	"github.com/jaredwarren/Gofing/pkg/notify"
 	"github.com/jaredwarren/Gofing/pkg/oui"
 	"github.com/jaredwarren/Gofing/pkg/ports"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
@@ -75,6 +76,12 @@ type Engine struct {
 	deepLookupFn     func(r *mdns.Resolver, ip string) mdns.LookupResult
 	activeNetworkKey string
 	activeSubnetCIDR string
+	discCtx          context.Context
+	isMonitoring     bool
+	settings         Settings
+	probeFn          func(ctx context.Context, ip string) (latency float64, ok bool)
+	notifyFn         func(title, message string) error
+	scanGen          uint64 // incremented each PerformScan; monitor drops stale results
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -91,8 +98,70 @@ func New(persist Persistence) *Engine {
 			return r.LookupHostnameDeep(ip)
 		},
 	}
+	e.settings = DefaultSettings()
 	e.loadFromStore()
+	e.loadSettings()
 	return e
+}
+
+// Start begins process-lifetime discovery helpers (always-on mDNS).
+func (e *Engine) Start(ctx context.Context, info *network.Info) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	e.mu.Lock()
+	e.discCtx = ctx
+	if e.notifyFn == nil {
+		e.notifyFn = notify.Show
+	}
+	e.mu.Unlock()
+
+	if e.mdnsResolver != nil {
+		e.mdnsResolver.SetNameLearnedHandler(e.onNameLearned)
+	}
+	if info != nil {
+		e.SetActiveNetwork(info)
+		e.listenMDNS(info.InterfaceName)
+	}
+	go e.RunMonitor(ctx)
+}
+
+func (e *Engine) listenMDNS(iface string) {
+	e.mu.RLock()
+	ctx := e.discCtx
+	r := e.mdnsResolver
+	e.mu.RUnlock()
+	if r == nil || ctx == nil || iface == "" {
+		return
+	}
+	r.Listen(ctx, iface)
+}
+
+// onNameLearned applies a multicast hostname to any device currently at that IP.
+func (e *Engine) onNameLearned(ip, hostname, source string) {
+	if ip == "" || hostname == "" {
+		return
+	}
+	e.mu.Lock()
+	var changed []Device
+	for _, d := range e.devices {
+		if d.IP != ip {
+			continue
+		}
+		before := d.Hostname
+		beforeSrc := d.NameSource
+		d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, hostname, source)
+		if d.Hostname != before || d.NameSource != beforeSrc {
+			changed = append(changed, *d)
+		}
+	}
+	e.mu.Unlock()
+
+	for i := range changed {
+		d := changed[i]
+		e.persistDevice(d)
+		e.emitEvent("device_updated", &d)
+	}
 }
 
 func (e *Engine) loadFromStore() {
@@ -277,13 +346,13 @@ func (e *Engine) PatchDevice(id string, patch DevicePatch) (Device, error) {
 
 // NameResolveResult is returned by ResolveDeviceName.
 type NameResolveResult struct {
-	Device     Device                `json:"device"`
-	Found      bool                  `json:"found"`
-	Changed    bool                  `json:"changed"`
-	Hostname   string                `json:"hostname,omitempty"`
-	NameSource string                `json:"name_source,omitempty"`
-	Candidates []mdns.NameCandidate  `json:"candidates,omitempty"`
-	Message    string                `json:"message,omitempty"`
+	Device     Device               `json:"device"`
+	Found      bool                 `json:"found"`
+	Changed    bool                 `json:"changed"`
+	Hostname   string               `json:"hostname,omitempty"`
+	NameSource string               `json:"name_source,omitempty"`
+	Candidates []mdns.NameCandidate `json:"candidates,omitempty"`
+	Message    string               `json:"message,omitempty"`
 }
 
 // ResolveDeviceName force-fetches Bonjour/DNS names for a device and persists
@@ -562,6 +631,7 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 		return e.GetDevices(), nil
 	}
 	e.isScanning = true
+	e.scanGen++
 	e.mu.Unlock()
 
 	defer func() {
@@ -589,8 +659,11 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 			"devices":     e.GetDevices(),
 		})
 	}
+	if netInfo != nil {
+		e.listenMDNS(netInfo.InterfaceName)
+	}
 
-	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, func(current, total int) {
+	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, netInfo.InterfaceName, func(current, total int) {
 		e.emitEvent("scan_progress", map[string]int{
 			"scanned": current,
 			"total":   total,
@@ -660,6 +733,7 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 		e.emitEvent("device_offline", d)
 		e.emitEvent("device_updated", d)
+		e.fireAlert("device_offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 	}
 	for _, d := range toPersist {
 		e.persistDevice(d)
@@ -765,6 +839,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		}
 		e.recordEvent("found", out.ID, fmt.Sprintf("Discovered %s (%s)", out.DisplayName(), out.IP))
 		e.emitEvent("device_found", &out)
+		e.fireAlert("new_device", out.ID, fmt.Sprintf("New device: %s (%s)", out.DisplayName(), out.IP))
 		if out.Hostname == "" {
 			go e.backgroundNameResolve(out.ID)
 		}
@@ -850,6 +925,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	}
 	if cameOnline {
 		e.recordEvent("online", out.ID, fmt.Sprintf("%s is online", out.DisplayName()))
+		e.fireAlert("device_online", out.ID, fmt.Sprintf("%s came back online", out.DisplayName()))
 		if out.Hostname == "" {
 			go e.backgroundNameResolve(out.ID)
 		}

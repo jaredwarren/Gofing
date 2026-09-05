@@ -7,6 +7,7 @@ const (
 	NameSourceHost = "host" // this Mac's computer name
 	NameSourceDHCP = "dhcp" // router DHCP client list
 	NameSourceARP  = "arp"  // macOS arp -a / Bonjour cache
+	NameSourceMDNS = "mdns" // always-on multicast listener (same rank as ARP)
 	NameSourceDNS  = "dns"  // reverse DNS or dns-sd PTR
 	NameSourceCast = "cast" // Chromecast / Nest eureka name
 	NameSourceHTTP = "http" // HTTP <title>
@@ -19,7 +20,7 @@ func NameSourceRank(src string) int {
 		return 90
 	case NameSourceDHCP:
 		return 85
-	case NameSourceARP:
+	case NameSourceARP, NameSourceMDNS:
 		return 80
 	case NameSourceDNS:
 		return 70

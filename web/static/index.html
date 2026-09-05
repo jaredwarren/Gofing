@@ -38,6 +38,8 @@
       </div>
 
       <div class="nav-actions">
+        <input type="file" id="dhcpFileInput" accept=".txt,.log,.json,.csv,text/plain,application/json" hidden>
+        <button id="dhcpImportBtn" class="btn-tool-secondary" type="button" title="Import router DHCP client list">Import DHCP</button>
         <button id="rescanBtn" class="btn-primary">
           <svg class="spin-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
@@ -74,6 +76,19 @@
         <div class="metric-value text-blue" id="statGateway">—</div>
         <div class="metric-sub" id="statLocalIP">My IP: —</div>
       </div>
+    </section>
+
+    <section class="activity-section" aria-label="Activity feed">
+      <div class="activity-header">
+        <h2 class="activity-title">Activity</h2>
+        <div class="activity-toggles">
+          <label class="activity-toggle"><input type="checkbox" id="alertsEnabledChk" checked> Alerts</label>
+          <label class="activity-toggle"><input type="checkbox" id="notifyMacosChk" checked> macOS notify</label>
+        </div>
+      </div>
+      <ul class="activity-feed" id="activityFeed">
+        <li class="activity-empty">No recent activity</li>
+      </ul>
     </section>
 
     <!-- Controls Bar (Search & Category Filters) -->

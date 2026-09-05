@@ -52,16 +52,17 @@ Gofing runs as a single Go binary on macOS. It:
 | Package / area | What exists today |
 |---|---|
 | [`main.go`](main.go) | Flags (`-port`, `-interval`, `-open`, `-data-dir`), initial scan, background ticker, HTTP server with graceful SIGINT/SIGTERM shutdown |
-| [`pkg/engine`](pkg/engine) | Persistent device inventory keyed by **stable MAC/ID**; private MAC reconciliation with generic name filtering; batch BoltDB sync; SSE events |
-| [`pkg/scanner`](pkg/scanner) | Parallel TCP/ICMP ping sweep + `arp -a` MAC & hostname extraction → `RawDevice` |
-| [`pkg/mdns`](pkg/mdns) | Background `dns-sd` browse + TXT model/type fingerprinting + ranked name source resolution |
+| [`pkg/engine`](pkg/engine) | Persistent inventory; always-on mDNS; **background presence monitor** (~10s); alert rules `new_device` / `device_offline` / `device_online` |
+| [`pkg/scanner`](pkg/scanner) | Parallel TCP/ICMP ping sweep + `arp -a` MAC & hostname extraction → `RawDevice`; `ProbeIP` for cheap presence checks |
+| [`pkg/mdns`](pkg/mdns) | Lifetime multicast listener + TXT model/type fingerprinting + ranked name source resolution |
+| [`pkg/notify`](pkg/notify) | macOS `osascript` desktop notifications |
 | [`pkg/oui`](pkg/oui) | Embedded 55k+ Nmap OUI + `oui_cache.json` disk cache under Application Support data dir |
 | [`pkg/ports`](pkg/ports) | `ScanPorts` (common) + `ScanPortsRange` (deep) — **fully wired into engine, REST API, & SSE** |
 | [`pkg/network`](pkg/network) | Active interface, IP, subnet CIDR, gateway IP, SSID, computer name |
-| [`pkg/server`](pkg/server) | `/api/network`, `/api/devices`, `/api/devices/{id}`, `/api/devices/{id}/portscan`, `/api/devices/{id}/history`, `/api/devices/{id}/resolve-name`, `/api/events` (SSE) |
-| [`web/static`](web/static) | Responsive SPA table + **tabbed right-side inspection drawer** (Overview, Ports, History, Tools, Security) |
+| [`pkg/server`](pkg/server) | `/api/network`, `/api/devices`, `/api/devices/{id}`, `/api/devices/{id}/portscan`, `/api/devices/{id}/history`, `/api/devices/{id}/resolve-name`, `/api/settings`, `/api/events/history`, `/api/events` (SSE) |
+| [`web/static`](web/static) | Responsive SPA table + **tabbed inspection drawer** + **activity feed** (live SSE + history restore) |
 
-**Gaps vs Fing:** no presence monitor/alerts (Phase 3), no WOL/ping/traceroute/speed test (Phase 4), no security score (Phase 5), no export (Phase 6), no launchd install (Phase 8).
+**Gaps vs Fing:** no WOL/ping/traceroute/speed test (Phase 4), no security score (Phase 5), no export (Phase 6), no launchd install (Phase 8).
 
 ---
 
@@ -380,7 +381,7 @@ type Device struct {
 
 ### Task 3.1 — Background presence monitor
 
-- [ ] **Goal:** Fast check of known devices between full subnet scans.
+- [x] **Goal:** Fast check of known devices between full subnet scans.
 - **Edit:** [`pkg/engine/engine.go`](pkg/engine/engine.go) (or `pkg/engine/monitor.go`), [`main.go`](main.go)
 - **Behavior:**
   - Loop every `MonitorIntervalSec` (default ~10s).
@@ -392,7 +393,7 @@ type Device struct {
 
 ### Task 3.2 — Alert rules + macOS notification
 
-- [ ] **Goal:** Notify on new device / offline / back online.
+- [x] **Goal:** Notify on new device / offline / back online.
 - **Create:** [`pkg/notify/notify.go`](pkg/notify/notify.go) (osascript display notification)
 - **Edit:** engine + settings in store
 - **Behavior:**
@@ -406,7 +407,7 @@ type Device struct {
 
 ### Task 3.3 — Activity feed UI
 
-- [ ] **Goal:** Global activity list (not only drawer History).
+- [x] **Goal:** Global activity list (not only drawer History).
 - **Edit:** [`web/static/*`](web/static), [`pkg/server/server.go`](pkg/server/server.go)
 - **HTTP:** `GET /api/events/history?limit=100`
 - **UI:** Side panel or section below metrics; prepend on SSE `alert` / presence events.
