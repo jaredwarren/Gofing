@@ -31,6 +31,12 @@ func Show(title, message string) error {
 	return showFallback(ctx, title, message)
 }
 
+// FindIconPath returns the resolved absolute path to the application icon image, or empty string.
+func FindIconPath() string {
+	_, icon := findHelperAndIcon()
+	return icon
+}
+
 func findHelperAndIcon() (helperPath string, iconPath string) {
 	exePath, err := os.Executable()
 	if err == nil {

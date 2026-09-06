@@ -4,11 +4,15 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 @interface NotificationDelegate : NSObject <NSUserNotificationCenterDelegate>
+@property (assign) BOOL delivered;
 @end
 
 @implementation NotificationDelegate
 - (BOOL)userNotificationCenter:(NSUserNotificationCenter *)center shouldPresentNotification:(NSUserNotification *)notification {
     return YES;
+}
+- (void)userNotificationCenter:(NSUserNotificationCenter *)center didDeliverNotification:(NSUserNotification *)notification {
+    self.delivered = YES;
 }
 @end
 
@@ -39,9 +43,14 @@ int main(int argc, const char * argv[]) {
         NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
         center.delegate = delegate;
         [center deliverNotification:notif];
-        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
+
+        NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:0.5];
+        while (!delegate.delivered && [limit timeIntervalSinceNow] > 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        }
     }
     return 0;
 }
 #pragma clang diagnostic pop
+
 

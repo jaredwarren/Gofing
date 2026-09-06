@@ -1,8 +1,8 @@
-.PHONY: build run app kill test clean
+.PHONY: build run app update kill test clean
 
 PORT ?= 8080
 
-# go-webui requires CGO (macOS WebKit / Cocoa frameworks).
+# Native macOS Cocoa and WebKit desktop window.
 build:
 	@mkdir -p build
 	@if [ ! -f build/gofing-notify ] || [ scripts/notify.m -nt build/gofing-notify ]; then \
@@ -16,6 +16,12 @@ run: build
 
 app:
 	@./scripts/build-app.sh
+
+update: app
+	@echo "Installing/updating /Applications/Gofing.app..."
+	@rm -rf /Applications/Gofing.app
+	@cp -R Gofing.app /Applications/
+	@echo "✅ /Applications/Gofing.app updated successfully."
 
 kill:
 	@PIDS=$$(pgrep -f 'Gofing\.app/Contents/MacOS/Gofing|/gofing-bin$$|/gofing -port|^\./gofing' 2>/dev/null || true); \

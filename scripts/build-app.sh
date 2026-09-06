@@ -11,7 +11,7 @@ RESOURCES_DIR="$CONTENTS/Resources"
 echo "Stopping any existing Gofing processes..."
 make -C "$DIR" kill 2>/dev/null || true
 
-echo "Building Gofing binary with go-webui..."
+echo "Building Gofing binary with native macOS WebKit..."
 make -C "$DIR" build
 
 echo "Creating native macOS application bundle..."

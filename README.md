@@ -8,19 +8,18 @@ macOS-native local network discovery and device diagnostics — a Fing-like tool
 
 ```bash
 make build    # CGO_ENABLED=1 go build -o gofing .
-make run              # ./gofing -port 8080  (opens go-webui desktop window)
+make run      # ./gofing -port 8080  (opens native macOS desktop window)
 make run PORT=8081    # if 8080 is already in use
-make app              # build Gofing.app for Dock / Finder
+make app      # build Gofing.app for Dock / Finder
+make update   # build and install/update /Applications/Gofing.app
 make test     # go test -v ./...
 ```
 
 ### Desktop app (Dock)
 
 ```bash
-make app
-open Gofing.app
-# optional install:
-cp -R Gofing.app /Applications/
+make update   # builds and updates /Applications/Gofing.app
+open -a Gofing
 ```
 
 Then right-click the Dock icon → **Options → Keep in Dock**.

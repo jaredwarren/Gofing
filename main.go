@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,14 +21,12 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/server"
 	"github.com/jaredwarren/Gofing/pkg/store"
 	"github.com/jaredwarren/Gofing/web"
-	"github.com/webui-dev/go-webui/v2"
 )
 
 func main() {
 	portFlag := flag.Int("port", 8080, "Port for the web interface")
 	intervalFlag := flag.Duration("interval", 30*time.Second, "Background network rescan interval")
-	openFlag := flag.Bool("open", true, "Open a desktop GUI window on startup (go-webui)")
-	browserFlag := flag.String("browser", "", "Preferred GUI browser: chrome, brave, webview, or auto")
+	openFlag := flag.Bool("open", true, "Open a desktop GUI window on startup")
 	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
 	dhcpFileFlag := flag.String("dhcp-file", "", "DHCP client-list file to poll (default: <data-dir>/dhcp-clients.txt if present)")
 	dhcpURLFlag := flag.String("dhcp-url", "", "HTTP URL returning DHCP leases as JSON or a client-list export")
@@ -44,7 +41,7 @@ func main() {
 	// Second Dock click while already running: reopen the UI instead of dying on the DB lock.
 	if *openFlag && httpReachable(url) {
 		slog.Info("Gofing already running; reopening window", "url", url)
-		runWebUI(url, *browserFlag)
+		runWindow(url)
 		return
 	}
 
@@ -57,7 +54,7 @@ func main() {
 	if err != nil {
 		if *openFlag && httpReachable(url) {
 			slog.Warn("Store locked but server reachable; reopening window", "error", err)
-			runWebUI(url, *browserFlag)
+			runWindow(url)
 			return
 		}
 		fail("Failed to open store", err, *openFlag)
@@ -129,7 +126,7 @@ func main() {
 	if err != nil {
 		if *openFlag && httpReachable(url) {
 			slog.Warn("Port in use but server reachable; reopening window", "error", err)
-			runWebUI(url, *browserFlag)
+			runWindow(url)
 			return
 		}
 		fail("Failed to listen on "+addr, err, *openFlag)
@@ -171,16 +168,16 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		slog.Info("Signal received, exiting WebUI...")
-		webui.Exit()
+		slog.Info("Signal received, terminating application...")
+		terminateNativeApp()
 	}()
 
-	// Give the HTTP server a moment to bind before the iframe loads.
-	time.Sleep(300 * time.Millisecond)
+	// Give the HTTP server a moment to bind before the window opens.
+	time.Sleep(200 * time.Millisecond)
 	if !httpReachable(url) {
 		fail("HTTP server did not become ready", fmt.Errorf("no response from %s", url), true)
 	}
-	runWebUI(url, *browserFlag)
+	runWindow(url)
 	shutdown()
 }
 
@@ -217,81 +214,16 @@ func pollDHCP(ctx context.Context, eng *engine.Engine, src dhcp.Source, interval
 	}
 }
 
-// runWebUI opens a go-webui desktop window (iframe → localhost) and blocks until it closes.
-func runWebUI(targetURL, browserName string) {
+// runWindow opens a native desktop window pointing to the local server.
+func runWindow(targetURL string) {
 	// Set native macOS Dock icon via Cocoa runtime
 	if pngBytes, err := web.GetIconPNG(); err == nil && len(pngBytes) > 0 {
 		setNativeDockIcon(pngBytes)
 	}
 
-	w := webui.NewWindow()
-	w.SetSize(1280, 860)
-	w.SetCenter()
-
-	// Configure native go-webui window icon
-	if svgIcon, err := web.GetIconSVG(); err == nil && svgIcon != "" {
-		w.SetIcon(svgIcon, "image/svg+xml")
-	}
-
-	containerHTML := fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>Gofing</title>
-    <link rel="icon" type="image/svg+xml" href="%s/icon.svg">
-    <link rel="icon" type="image/png" href="%s/favicon.png">
-    <script src="webui.js"></script>
-    <style>
-        html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%%;
-            height: 100%%;
-            overflow: hidden;
-            background: #0f172a;
-        }
-        iframe {
-            width: 100vw;
-            height: 100vh;
-            border: none;
-            display: block;
-        }
-    </style>
-</head>
-<body>
-    <iframe src="%s"></iframe>
-</body>
-</html>`, targetURL, targetURL, targetURL)
-
-	var showErr error
-	switch strings.ToLower(strings.TrimSpace(browserName)) {
-	case "chrome":
-		showErr = w.ShowBrowser(containerHTML, webui.Chrome)
-	case "brave":
-		showErr = w.ShowBrowser(containerHTML, webui.Brave)
-	case "webview":
-		showErr = w.ShowBrowser(containerHTML, webui.Webview)
-	default:
-		if webui.BrowserExists(webui.Brave) {
-			showErr = w.ShowBrowser(containerHTML, webui.Brave)
-		} else if webui.BrowserExists(webui.Chrome) {
-			showErr = w.ShowBrowser(containerHTML, webui.Chrome)
-		} else {
-			showErr = w.Show(containerHTML)
-		}
-	}
-	if showErr != nil {
-		slog.Warn("Failed to open preferred browser, falling back", "error", showErr)
-		if err := w.Show(containerHTML); err != nil {
-			alert("Gofing", "Failed to open window: "+err.Error())
-			slog.Error("WebUI Show failed", "error", err)
-			return
-		}
-	}
-
-	slog.Info("Desktop window active; closing it will terminate this Gofing process")
-	webui.Wait()
-	slog.Info("Window closed")
+	slog.Info("Native desktop window active; closing it will terminate this Gofing process")
+	runNativeWindow(targetURL)
+	slog.Info("Native window closed")
 }
 
 func httpReachable(url string) bool {

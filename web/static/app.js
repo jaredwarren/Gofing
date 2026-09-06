@@ -311,24 +311,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  const btnTestNotify = document.getElementById('btnTestNotify');
-  if (btnTestNotify) {
-    btnTestNotify.addEventListener('click', async () => {
-      btnTestNotify.disabled = true;
-      btnTestNotify.textContent = '...';
-      try {
-        await fetch('/api/notify/test', { method: 'POST' });
-      } catch (err) {
-        console.error('Failed to trigger test notification:', err);
-      } finally {
-        setTimeout(() => {
-          btnTestNotify.disabled = false;
-          btnTestNotify.textContent = 'Test';
-        }, 1200);
-      }
-    });
-  }
-
   function initSSE() {
     const eventSource = new EventSource('/api/events');
 
