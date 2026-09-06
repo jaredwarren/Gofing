@@ -311,6 +311,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const btnTestNotify = document.getElementById('btnTestNotify');
+  if (btnTestNotify) {
+    btnTestNotify.addEventListener('click', async () => {
+      btnTestNotify.disabled = true;
+      btnTestNotify.textContent = '...';
+      try {
+        await fetch('/api/notify/test', { method: 'POST' });
+      } catch (err) {
+        console.error('Failed to trigger test notification:', err);
+      } finally {
+        setTimeout(() => {
+          btnTestNotify.disabled = false;
+          btnTestNotify.textContent = 'Test';
+        }, 1200);
+      }
+    });
+  }
+
   function initSSE() {
     const eventSource = new EventSource('/api/events');
 
@@ -482,17 +500,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function showProgress(pct) {
-    progressContainer.style.display = 'block';
-    progressBarFill.style.width = `${pct}%`;
+  function showProgress(_pct) {
+    // Progress bar is unreliable for now — keep it hidden.
+    if (progressContainer) progressContainer.style.display = 'none';
   }
 
   function hideProgress() {
-    progressBarFill.style.width = '100%';
-    setTimeout(() => {
-      progressContainer.style.display = 'none';
-      progressBarFill.style.width = '0%';
-    }, 500);
+    if (progressContainer) progressContainer.style.display = 'none';
+    if (progressBarFill) progressBarFill.style.width = '0%';
   }
 
   function updateMetrics() {

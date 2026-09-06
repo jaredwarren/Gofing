@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/png" href="favicon.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -15,16 +16,7 @@
     <header class="navbar">
       <div class="brand">
         <div class="logo-icon">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 20a8 8 0 1 0 0-16 8 8 0 0 0 0 16z"></path>
-            <path d="M12 14a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"></path>
-            <path d="M12 2v2"></path>
-            <path d="M12 20v2"></path>
-            <path d="m4.93 4.93 1.41 1.41"></path>
-            <path d="m17.66 17.66 1.41 1.41"></path>
-            <path d="M2 12h2"></path>
-            <path d="M20 12h2"></path>
-          </svg>
+          <img src="icon.svg" width="38" height="38" alt="Gofing" style="display:block; border-radius: 9px;">
         </div>
         <span class="brand-title">Gofing</span>
         <span class="brand-badge">macOS Native</span>
@@ -84,6 +76,7 @@
         <div class="activity-toggles">
           <label class="activity-toggle"><input type="checkbox" id="alertsEnabledChk" checked> Alerts</label>
           <label class="activity-toggle"><input type="checkbox" id="notifyMacosChk" checked> macOS notify</label>
+          <button type="button" class="btn-test-notify" id="btnTestNotify" title="Send a test macOS notification">Test</button>
         </div>
       </div>
       <ul class="activity-feed" id="activityFeed">

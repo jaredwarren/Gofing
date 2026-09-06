@@ -126,6 +126,13 @@ func (e *Engine) Start(ctx context.Context, info *network.Info) {
 	go e.RunMonitor(ctx)
 }
 
+// SetNotifyFn overrides the notification delivery function.
+func (e *Engine) SetNotifyFn(fn func(title, message string) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.notifyFn = fn
+}
+
 func (e *Engine) listenMDNS(iface string) {
 	e.mu.RLock()
 	ctx := e.discCtx

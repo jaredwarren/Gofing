@@ -19,7 +19,8 @@ This document is written for an AI coding agent. Each task is a self-contained w
 5. Check the task box (`- [ ]` → `- [x]`) in this file when acceptance criteria pass.
 6. Prefer one logical commit (or PR) per task. Do not skip ahead to later phases.
 
-**Do not** introduce Windows/Linux abstractions, CVE databases, credentialed vulnerability scanners, or CGO dependencies.
+**Do not** introduce Windows/Linux abstractions, CVE databases, or credentialed vulnerability scanners.
+CGO is allowed only for the [go-webui](https://github.com/webui-dev/go-webui) desktop shell in `main` (same pattern as PrayerList).
 
 ---
 
@@ -41,7 +42,8 @@ Gofing runs as a single Go binary on macOS. It:
 | Decision | Choice |
 |---|---|
 | Platform | **macOS only** — shell out to `arp`, `ping`, `dns-sd`, `traceroute`, `osascript`, etc. |
-| Storage | **BoltDB** (`go.etcd.io/bbolt`) via `pkg/store` — pure Go, no CGO |
+| Storage | **BoltDB** (`go.etcd.io/bbolt`) via `pkg/store` — pure Go |
+| GUI shell | **[go-webui](https://github.com/webui-dev/go-webui)** (CGO; launches a real browser/WebView as a desktop window). Packages stay CGO-free; only `main` links WebUI. |
 | Ambition | **Full Fing parity** within the phase list below |
 | Security depth | **Lightweight heuristics only** (Phase 5) — no CVE/NSE/credentialed scans |
 

@@ -15,6 +15,7 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/dhcp"
 	"github.com/jaredwarren/Gofing/pkg/engine"
 	"github.com/jaredwarren/Gofing/pkg/network"
+	"github.com/jaredwarren/Gofing/pkg/notify"
 )
 
 // Server encapsulates the HTTP API, SSE streaming, and embedded frontend delivery.
@@ -52,6 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/events/history", s.handleEventsHistory)
 	mux.HandleFunc("/api/events", s.handleSSE)
+	mux.HandleFunc("/api/notify/test", s.handleTestNotification)
 
 	fileServer := http.FileServer(http.FS(s.staticFS))
 	mux.Handle("/", fileServer)
@@ -399,4 +401,17 @@ func (s *Server) broadcastSSE(eventType string, data interface{}) {
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) handleTestNotification(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	err := notify.Show("Gofing", "Test alert: local network notifications are working!")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "ok", "message": "Notification sent"})
 }

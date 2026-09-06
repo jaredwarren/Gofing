@@ -1,5 +1,8 @@
 # Ignore binary
 gofing
+Gofing.app/
+build/*.app/
+build/gofing-notify
 
 # Local DHCP export (home MACs / IPs / hostnames)
 sample.log
@@ -27,3 +30,5 @@ server/server_bin
 
 .env
 server/.env
+
+dump2.json
