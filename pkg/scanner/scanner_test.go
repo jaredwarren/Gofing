@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -132,5 +133,35 @@ func TestMergeProbeAndARPIncludesPingWithoutARP(t *testing.T) {
 	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, map[string]RawDevice{}, "10.0.0.0/24", "en0", time.Now())
 	if len(got) != 1 || got[0].MAC != "" || !got[0].IsOnline {
 		t.Fatalf("unexpected result: %+v", got)
+	}
+}
+
+func TestFilterSkippedIPs(t *testing.T) {
+	ips := []string{"192.168.0.1", "192.168.0.2", "192.168.0.3"}
+	got := filterSkippedIPs(ips, map[string]float64{"192.168.0.2": 1.5})
+	if len(got) != 2 || got[0] != "192.168.0.1" || got[1] != "192.168.0.3" {
+		t.Fatalf("got %v", got)
+	}
+	if same := filterSkippedIPs(ips, nil); len(same) != 3 {
+		t.Fatalf("nil skip should keep all, got %v", same)
+	}
+}
+
+func TestApplySkipHits(t *testing.T) {
+	ping := map[string]float64{"192.168.0.1": 2.0}
+	applySkipHits(ping, map[string]float64{"192.168.0.5": 1.1, "192.168.0.1": 9.9})
+	if ping["192.168.0.5"] != 1.1 {
+		t.Fatalf("missing skip hit: %v", ping)
+	}
+	if ping["192.168.0.1"] != 2.0 {
+		t.Fatalf("existing ping result must not be overwritten: %v", ping)
+	}
+}
+
+func TestProbeIPQuickCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, ok := ProbeIPQuick(ctx, "192.0.2.1"); ok {
+		t.Fatal("cancelled probe must not report a hit")
 	}
 }

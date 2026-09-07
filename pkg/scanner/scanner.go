@@ -34,10 +34,15 @@ func New() *Scanner {
 	return &Scanner{}
 }
 
+// commonTCPPorts are tried for cheap reachability (full sweep and quick probe).
+var commonTCPPorts = []string{"80", "443", "22", "445", "53", "8080", "548", "5000"}
+
 // PerformScan executes a ping sweep across the subnet, then reads the ARP table.
 // Presence is the union of: hosts that answered ICMP/TCP, and complete in-subnet
 // ARP rows on iface (Layer-2 evidence for devices that ignore ping).
-func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
+// skipHits are IPs already confirmed online (presence-first); they are not
+// re-probed but are treated as ping hits so ARP merge and fingerprinting still run.
+func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, skipHits map[string]float64, progressCb func(scannedCount, total int)) ([]RawDevice, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -46,10 +51,10 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, pro
 		return nil, fmt.Errorf("failed to expand CIDR: %w", err)
 	}
 
-	// 1. Fast Ping Sweep across subnet using parallel worker pool
-	pingResults := s.pingSweep(ctx, ips, progressCb)
+	toProbe := filterSkippedIPs(ips, skipHits)
+	pingResults := s.pingSweep(ctx, toProbe, progressCb)
+	applySkipHits(pingResults, skipHits)
 
-	// 2. Parse macOS ARP table for MAC enrichment and L2-only hosts
 	arpByIP := make(map[string]RawDevice)
 	arpDevices, err := s.parsemacOSARPTable(ctx)
 	if err != nil {
@@ -60,6 +65,34 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, pro
 	}
 
 	return mergeProbeAndARP(pingResults, arpByIP, subnetCIDR, iface, time.Now()), nil
+}
+
+// ARPTable returns complete rows from macOS `arp -a`.
+func (s *Scanner) ARPTable(ctx context.Context) ([]RawDevice, error) {
+	return s.parsemacOSARPTable(ctx)
+}
+
+func filterSkippedIPs(ips []string, skipHits map[string]float64) []string {
+	if len(skipHits) == 0 {
+		return ips
+	}
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if _, skip := skipHits[ip]; skip {
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
+}
+
+func applySkipHits(pingResults, skipHits map[string]float64) {
+	for ip, lat := range skipHits {
+		if _, ok := pingResults[ip]; ok {
+			continue
+		}
+		pingResults[ip] = lat
+	}
 }
 
 // mergeProbeAndARP returns probe-responsive hosts plus complete ARP entries that
@@ -177,12 +210,64 @@ func ProbeIP(ctx context.Context, ip string) (float64, bool) {
 	return pingIPFast(ctx, ip)
 }
 
+// ProbeIPQuick is a faster presence check for known inventory IPs: parallel TCP
+// (100ms), then a single ICMP (400ms). Worst case ~0.5s vs ~1.7s for ProbeIP.
+func ProbeIPQuick(ctx context.Context, ip string) (float64, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	start := time.Now()
+	if ok := probeTCPParallel(ctx, ip, 100*time.Millisecond); ok {
+		return float64(time.Since(start).Microseconds()) / 1000.0, true
+	}
+	return pingOnce(ctx, ip, 400*time.Millisecond)
+}
+
+func probeTCPParallel(ctx context.Context, ip string, timeout time.Duration) bool {
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	hit := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	for _, port := range commonTCPPorts {
+		wg.Add(1)
+		go func(port string) {
+			defer wg.Done()
+			var d net.Dialer
+			conn, err := d.DialContext(dialCtx, "tcp", net.JoinHostPort(ip, port))
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+			select {
+			case hit <- struct{}{}:
+				cancel()
+			default:
+			}
+		}(port)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-hit:
+		return true
+	case <-done:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func pingIPFast(ctx context.Context, ip string) (float64, bool) {
 	// TCP probes first — moderately patient to avoid Wi‑Fi false negatives.
-	commonPorts := []string{"80", "443", "22", "445", "53", "8080", "548", "5000"}
 	start := time.Now()
 
-	for _, port := range commonPorts {
+	for _, port := range commonTCPPorts {
 		var d net.Dialer
 		d.Timeout = 100 * time.Millisecond
 		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))

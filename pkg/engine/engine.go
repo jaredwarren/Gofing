@@ -80,8 +80,10 @@ type Engine struct {
 	isMonitoring     bool
 	settings         Settings
 	probeFn          func(ctx context.Context, ip string) (latency float64, ok bool)
+	arpFn            func(ctx context.Context) ([]scanner.RawDevice, error)
 	notifyFn         func(title, message string) error
 	scanGen          uint64 // incremented each PerformScan; monitor drops stale results
+	startupPresence  bool   // true until first probeKnown; suppresses launch online alerts
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -97,6 +99,7 @@ func New(persist Persistence) *Engine {
 		deepLookupFn: func(r *mdns.Resolver, ip string) mdns.LookupResult {
 			return r.LookupHostnameDeep(ip)
 		},
+		startupPresence: true,
 	}
 	e.settings = DefaultSettings()
 	e.loadFromStore()
@@ -670,7 +673,9 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 		e.listenMDNS(netInfo.InterfaceName)
 	}
 
-	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, netInfo.InterfaceName, func(current, total int) {
+	skipHits, confirmedIDs := e.probeKnown(ctx, netInfo)
+
+	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, netInfo.InterfaceName, skipHits, func(current, total int) {
 		e.emitEvent("scan_progress", map[string]int{
 			"scanned": current,
 			"total":   total,
@@ -691,6 +696,9 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 	e.mu.Unlock()
 
 	seenIDs := make(map[string]bool)
+	for id := range confirmedIDs {
+		seenIDs[id] = true
+	}
 	var seenMu sync.Mutex
 
 	var wg sync.WaitGroup
