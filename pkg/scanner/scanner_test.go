@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -163,5 +164,95 @@ func TestProbeIPQuickCancelled(t *testing.T) {
 	cancel()
 	if _, ok := ProbeIPQuick(ctx, "192.0.2.1"); ok {
 		t.Fatal("cancelled probe must not report a hit")
+	}
+}
+
+func TestARPTableCachedReusesWithinTTL(t *testing.T) {
+	s := New()
+	calls := 0
+	s.arpExecFn = func(ctx context.Context, numeric bool) ([]RawDevice, error) {
+		calls++
+		return []RawDevice{{IP: "192.168.0.5", MAC: "AA:BB:CC:DD:EE:05"}}, nil
+	}
+
+	if _, err := s.ARPTableNumeric(context.Background(), time.Minute); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if _, err := s.ARPTableNumeric(context.Background(), time.Minute); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("exec ran %d times within the TTL; want 1", calls)
+	}
+
+	// maxAge <= 0 must always re-exec.
+	if _, err := s.ARPTableNumeric(context.Background(), 0); err != nil {
+		t.Fatalf("forced call: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("exec ran %d times; want 2 after a forced refresh", calls)
+	}
+}
+
+func TestARPTableCachedReturnsCopy(t *testing.T) {
+	s := New()
+	s.arpExecFn = func(ctx context.Context, numeric bool) ([]RawDevice, error) {
+		return []RawDevice{{IP: "192.168.0.5", MAC: "AA:BB:CC:DD:EE:05"}}, nil
+	}
+	first, err := s.ARPTableNumeric(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	first[0].IP = "mutated"
+
+	second, err := s.ARPTableNumeric(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if second[0].IP != "192.168.0.5" {
+		t.Fatalf("caller mutated the cache: got %q", second[0].IP)
+	}
+}
+
+func TestARPTableCachedPropagatesError(t *testing.T) {
+	s := New()
+	s.arpExecFn = func(ctx context.Context, numeric bool) ([]RawDevice, error) {
+		return nil, errors.New("arp unavailable")
+	}
+	if _, err := s.ARPTableNumeric(context.Background(), time.Minute); err == nil {
+		t.Fatal("expected the exec error to propagate")
+	}
+}
+
+func TestARPTableNumericAndNamedCacheSeparately(t *testing.T) {
+	s := New()
+	var numericCalls, namedCalls int
+	s.arpExecFn = func(ctx context.Context, numeric bool) ([]RawDevice, error) {
+		if numeric {
+			numericCalls++
+		} else {
+			namedCalls++
+		}
+		return []RawDevice{{IP: "192.168.0.5", MAC: "AA:BB:CC:DD:EE:05"}}, nil
+	}
+
+	// The two forms cost three orders of magnitude apart, so a cheap numeric
+	// read must never be served from the expensive name-resolving cache, or
+	// vice versa.
+	if _, err := s.ARPTableNumeric(context.Background(), time.Minute); err != nil {
+		t.Fatalf("numeric: %v", err)
+	}
+	if _, err := s.ARPTableCached(context.Background(), time.Minute); err != nil {
+		t.Fatalf("named: %v", err)
+	}
+	if numericCalls != 1 || namedCalls != 1 {
+		t.Fatalf("numeric=%d named=%d; want one exec of each", numericCalls, namedCalls)
+	}
+
+	// Each form then serves from its own cache.
+	_, _ = s.ARPTableNumeric(context.Background(), time.Minute)
+	_, _ = s.ARPTableCached(context.Background(), time.Minute)
+	if numericCalls != 1 || namedCalls != 1 {
+		t.Fatalf("numeric=%d named=%d; want both still cached", numericCalls, namedCalls)
 	}
 }

@@ -211,3 +211,83 @@ func TestProbeKnownIgnoresOtherNetwork(t *testing.T) {
 		t.Fatal("cafe must stay offline")
 	}
 }
+
+// TestPresenceSkipsMissConfirmedMidPass covers the guard that replaced the old
+// scanGen counter. While a presence pass is probing, another tier — the sweep,
+// the mDNS listener, a DHCP import — can prove a device present. Our pass's
+// miss is then stale evidence and must not count toward the offline debounce.
+func TestPresenceSkipsMissConfirmedMidPass(t *testing.T) {
+	eng := New(nil)
+	info := netInfoFor("192.168.0.0/24", "192.168.0.1")
+	eng.SetActiveNetwork(&info)
+	id := eng.upsertDevice(
+		scanner.RawDevice{IP: "192.168.0.41", MAC: "AA:BB:CC:DD:EE:41", LatencyMs: 1},
+		mdns.DeviceDetails{Hostname: "pi"}, "Acme", time.Now(), nil)
+
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) {
+		// Stand in for another tier confirming the device while we probe.
+		eng.mu.Lock()
+		if d, ok := eng.devices[id]; ok {
+			d.LastSeen = time.Now()
+		}
+		eng.mu.Unlock()
+		return 0, false
+	}
+
+	for i := 0; i < offlineMissThreshold+2; i++ {
+		eng.PresenceOnce(context.Background(), &info)
+	}
+
+	eng.mu.RLock()
+	misses := eng.missCount[id]
+	eng.mu.RUnlock()
+	if misses != 0 {
+		t.Fatalf("missCount = %d; a miss older than the last sighting must not count", misses)
+	}
+	if dev, _ := eng.GetDevice(id); !dev.IsOnline {
+		t.Fatal("device was marked offline on stale evidence")
+	}
+}
+
+func TestPresenceCountsMissWhenNothingElseConfirms(t *testing.T) {
+	eng := New(nil)
+	info := netInfoFor("192.168.0.0/24", "192.168.0.1")
+	eng.SetActiveNetwork(&info)
+	id := eng.upsertDevice(
+		scanner.RawDevice{IP: "192.168.0.42", MAC: "AA:BB:CC:DD:EE:42", LatencyMs: 1},
+		mdns.DeviceDetails{Hostname: "pi"}, "Acme", time.Now(), nil)
+
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) { return 0, false }
+
+	// The mirror of the test above: with nobody vouching for it, the debounce
+	// must still retire the device.
+	for i := 0; i < offlineMissThreshold; i++ {
+		eng.PresenceOnce(context.Background(), &info)
+	}
+	if dev, _ := eng.GetDevice(id); dev.IsOnline {
+		t.Fatalf("device should be offline after %d misses", offlineMissThreshold)
+	}
+}
+
+func TestPresenceEnqueuesWokeDevice(t *testing.T) {
+	eng := New(nil)
+	info := netInfoFor("192.168.0.0/24", "192.168.0.1")
+	eng.SetActiveNetwork(&info)
+	id := seedOfflineDevice(eng, "192.168.0.43", "AA:BB:CC:DD:EE:43", "")
+
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) { return 2.0, true }
+
+	// A device that wakes up should be fingerprinted promptly — behaviour the
+	// old every-30s full scan provided by accident.
+	eng.PresenceOnce(context.Background(), &info)
+	if dev, _ := eng.GetDevice(id); !dev.IsOnline {
+		t.Fatal("device should be online")
+	}
+	pending, inflight := eng.enrichQ.stats()
+	if pending+inflight == 0 {
+		t.Fatal("a device that came online was not queued for enrichment")
+	}
+}

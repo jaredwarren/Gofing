@@ -25,7 +25,7 @@ import (
 
 func main() {
 	portFlag := flag.Int("port", 8080, "Port for the web interface")
-	intervalFlag := flag.Duration("interval", 30*time.Second, "Background network rescan interval")
+	intervalFlag := flag.Duration("interval", 5*time.Minute, "Deprecated: seeds the Tier-2 discovery sweep interval; prefer PATCH /api/settings")
 	openFlag := flag.Bool("open", true, "Open a desktop GUI window on startup")
 	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
 	dhcpFileFlag := flag.String("dhcp-file", "", "DHCP client-list file to poll (default: <data-dir>/dhcp-clients.txt if present)")
@@ -34,6 +34,10 @@ func main() {
 	flag.Parse()
 
 	setupLogging(*openFlag)
+	if os.Getenv("GOFING_DEBUG") != "" {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr,
+			&slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d", *portFlag)
 	slog.Info("⚡ Starting Gofing Local Network Discovery Service...")
@@ -79,6 +83,24 @@ func main() {
 	defer cancel()
 
 	devEngine := engine.New(db)
+
+	// -interval predates the settings API. Honour it when explicitly passed,
+	// but do not let its default silently override a stored preference.
+	intervalSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "interval" {
+			intervalSet = true
+		}
+	})
+	if intervalSet {
+		sec := int(intervalFlag.Seconds())
+		if _, err := devEngine.UpdateSettings(engine.SettingsPatch{ScanIntervalSec: &sec}); err != nil {
+			slog.Warn("failed to seed discovery interval from -interval", "error", err)
+		} else {
+			slog.Info("discovery interval seeded from -interval", "sec", sec)
+		}
+	}
+
 	devEngine.Start(ctx, netInfo)
 	slog.Info("📂 Loaded known devices from store", "count", len(devEngine.GetDevices()), "network", engine.NetworkKeyFromInfo(netInfo))
 
@@ -87,32 +109,6 @@ func main() {
 		dhcpFile = filepath.Join(filepath.Dir(dbPath), "dhcp-clients.txt")
 	}
 	go pollDHCP(ctx, devEngine, dhcp.Source{File: dhcpFile, URL: *dhcpURLFlag}, *dhcpIntervalFlag)
-
-	go func() {
-		slog.Info("🔍 Performing initial subnet scan...")
-		devices, err := devEngine.PerformScan(ctx, netInfo)
-		if err != nil {
-			slog.Warn("⚠️ Initial scan error", "error", err)
-		} else {
-			slog.Info("✅ Initial scan completed", "discovered_devices", len(devices))
-		}
-	}()
-
-	go func() {
-		ticker := time.NewTicker(*intervalFlag)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if currentInfo, err := network.GetActiveNetworkInfo(); err == nil {
-					_, _ = devEngine.PerformScan(ctx, currentInfo)
-				}
-			}
-		}
-	}()
 
 	staticFS, err := web.GetStaticFS()
 	if err != nil {

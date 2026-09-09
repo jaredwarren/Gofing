@@ -117,8 +117,12 @@ func TestApplyMissesIgnoresOtherNetwork(t *testing.T) {
 	eng.devices[home.ID] = home
 	eng.devices[cafe.ID] = cafe
 
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) { return 0, false }
+
+	info := &network.Info{SSID: "Home", SubnetCIDR: "192.168.1.0/24", GatewayIP: "192.168.1.1"}
 	for i := 0; i < offlineMissThreshold; i++ {
-		eng.applyMisses(map[string]bool{}, nil)
+		eng.PresenceOnce(context.Background(), info)
 	}
 	if eng.devices[home.ID].IsOnline {
 		t.Fatal("home device should be offline after misses")
@@ -419,17 +423,20 @@ func TestOfflineDebounceRequiresConsecutiveMisses(t *testing.T) {
 		t.Fatal("expected online after discover")
 	}
 
-	// Simulate two missed scans — should stay online.
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) { return 0, false }
+
+	// Misses short of the threshold must not flip it.
 	for i := 0; i < offlineMissThreshold-1; i++ {
-		eng.applyMisses(map[string]bool{}, map[string]bool{id: true})
+		eng.PresenceOnce(context.Background(), nil)
 		dev, _ = eng.GetDevice(id)
 		if !dev.IsOnline {
 			t.Fatalf("went offline after %d miss(es); threshold is %d", i+1, offlineMissThreshold)
 		}
 	}
 
-	// Third miss flips offline.
-	eng.applyMisses(map[string]bool{}, map[string]bool{id: true})
+	// The threshold miss flips offline.
+	eng.PresenceOnce(context.Background(), nil)
 	dev, _ = eng.GetDevice(id)
 	if dev.IsOnline {
 		t.Fatal("expected offline after consecutive misses")

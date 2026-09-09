@@ -1,9 +1,12 @@
 package oui
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -70,3 +73,47 @@ func TestCacheWritesToDataDirNotCwd(t *testing.T) {
 		t.Fatalf("unexpected cwd cache file %s", cwdOui)
 	}
 }
+
+func TestLookupVendorLocalNeverHitsNetwork(t *testing.T) {
+	db := DefaultDB()
+	// A prefix that is not in the embedded IEEE table and not privately
+	// administered must miss locally rather than reaching for the API.
+	db.httpClient = &http.Client{
+		Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("LookupVendorLocal must not make an HTTP request")
+			return nil, nil
+		}),
+	}
+	t.Cleanup(func() { db.httpClient = &http.Client{Timeout: 1500 * time.Millisecond} })
+
+	if got := db.LookupVendorLocal("F2:3C:91:44:55:66"); got != "" {
+		// A non-empty answer is fine as long as it came from the local tables;
+		// only an HTTP attempt (caught above) is a failure.
+		t.Logf("resolved locally to %q", got)
+	}
+}
+
+func TestLookupVendorLocalKnownPrefix(t *testing.T) {
+	// Apple's 8C:85:90 is in the embedded IEEE table.
+	got := DefaultDB().LookupVendorLocal("8C:85:90:24:10:B7")
+	if got == "" {
+		t.Fatal("expected an embedded-table hit for 8C:85:90")
+	}
+	if !strings.Contains(strings.ToLower(got), "apple") {
+		t.Fatalf("got vendor %q; want an Apple string", got)
+	}
+}
+
+func TestLookupVendorLocalEdgeCases(t *testing.T) {
+	db := DefaultDB()
+	if got := db.LookupVendorLocal(""); got != "Unknown Vendor" {
+		t.Fatalf("empty MAC: got %q, want Unknown Vendor", got)
+	}
+	if got := db.LookupVendorLocal("AA:BB"); got != "Generic Device" {
+		t.Fatalf("short MAC: got %q, want Generic Device", got)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

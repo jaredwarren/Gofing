@@ -147,35 +147,65 @@ func LookupVendor(mac string) string {
 	return DefaultDB().LookupVendor(mac)
 }
 
+// LookupVendorLocal resolves a vendor from the embedded IEEE database and the
+// disk cache only, never over the network. Returns "" on a miss so a caller on
+// a latency-sensitive path can defer the HTTP lookup to a background tier.
+func LookupVendorLocal(mac string) string {
+	return DefaultDB().LookupVendorLocal(mac)
+}
+
+// LookupVendorLocal is the network-free half of LookupVendor. A miss returns "".
+func (db *DB) LookupVendorLocal(mac string) string {
+	if mac == "" {
+		return "Unknown Vendor"
+	}
+
+	clean := cleanMACPrefix(mac)
+	if len(clean) < 6 {
+		return "Generic Device"
+	}
+	prefix := clean[:6]
+
+	// 1. Embedded 52,000+ entry IEEE database.
+	if vendor, found := db.ouiMap[prefix]; found && vendor != "" {
+		return normalizeVendor(vendor)
+	}
+
+	// 2. Disk cache of prior API answers.
+	db.cacheMu.RLock()
+	cachedVendor, foundInCache := db.diskCache[prefix]
+	db.cacheMu.RUnlock()
+	if foundInCache {
+		return cachedVendor
+	}
+
+	return ""
+}
+
+// cleanMACPrefix strips separators and upper-cases a MAC for prefix lookups.
+func cleanMACPrefix(mac string) string {
+	clean := strings.ToUpper(mac)
+	clean = strings.ReplaceAll(clean, ":", "")
+	clean = strings.ReplaceAll(clean, "-", "")
+	clean = strings.ReplaceAll(clean, ".", "")
+	return clean
+}
+
 // LookupVendor checks embedded DB -> disk cache -> maclookup.app API on the DB instance.
 func (db *DB) LookupVendor(mac string) string {
 	if mac == "" {
 		return "Unknown Vendor"
 	}
 
-	clean := strings.ToUpper(mac)
-	clean = strings.ReplaceAll(clean, ":", "")
-	clean = strings.ReplaceAll(clean, "-", "")
-	clean = strings.ReplaceAll(clean, ".", "")
-
+	clean := cleanMACPrefix(mac)
 	if len(clean) < 6 {
 		return "Generic Device"
 	}
-
 	prefix := clean[:6]
 
-	// 1. Check embedded 52,000+ IEEE database
-	if vendor, found := db.ouiMap[prefix]; found && vendor != "" {
-		return normalizeVendor(vendor)
-	}
-
-	// 2. Check disk cache
-	db.cacheMu.RLock()
-	cachedVendor, foundInCache := db.diskCache[prefix]
-	db.cacheMu.RUnlock()
-
-	if foundInCache {
-		return cachedVendor
+	// 1+2. Embedded IEEE database, then the disk cache.
+	if local := db.LookupVendorLocal(mac); local != "" {
+		return local
 	}
 
 	// 3. Check locally if it's a randomized private MAC

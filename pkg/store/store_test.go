@@ -113,7 +113,8 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSettings defaults: %v", err)
 	}
-	if defaults.ScanIntervalSec != 30 || !defaults.AlertsEnabled {
+	wantDefaults := engine.DefaultSettings()
+	if defaults.ScanIntervalSec != wantDefaults.ScanIntervalSec || !defaults.AlertsEnabled {
 		t.Fatalf("unexpected defaults: %+v", defaults)
 	}
 

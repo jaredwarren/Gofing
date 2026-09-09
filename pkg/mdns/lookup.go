@@ -55,6 +55,14 @@ func (r *Resolver) CachedName(ip string) (hostname, source string) {
 // LookupHostnameDeep aggressively resolves a Bonjour/DNS name for ip.
 // Intended for on-demand "Resolve name" actions (longer timeouts + retries).
 func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
+	return r.LookupHostnameDeepCtx(context.Background(), ip)
+}
+
+// LookupHostnameDeepCtx is LookupHostnameDeep bounded by ctx.
+func (r *Resolver) LookupHostnameDeepCtx(ctx context.Context, ip string) LookupResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var candidates []NameCandidate
 	bestName, bestSrc := "", NameSourceNone
 
@@ -71,13 +79,11 @@ func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
 		consider(c.Hostname, c.Source)
 	}
 
-	if h := reverseDNSWithTimeout(ip, 2*time.Second); h != "" {
+	if h := reverseDNSWithTimeout(ctx, ip, 2*time.Second); h != "" {
 		consider(h, NameSourceDNS)
 	}
 	// Dedicated mDNS PTR with a long wait; dns-sd is asynchronous.
-	if h := mdnsReversePTR(ip, 3500*time.Millisecond); h != "" {
-		consider(h, NameSourceDNS)
-	} else if h := mdnsReversePTR(ip, 3500*time.Millisecond); h != "" {
+	if h := mdnsReversePTR(ctx, ip, 3500*time.Millisecond); h != "" {
 		consider(h, NameSourceDNS)
 	}
 
@@ -104,21 +110,30 @@ func (r *Resolver) LookupHostnameDeep(ip string) LookupResult {
 
 // LookupHostnameQuick is used during scans: cache + moderate reverse DNS/mDNS.
 func (r *Resolver) LookupHostnameQuick(ip string) (hostname, source string) {
+	return r.LookupHostnameQuickCtx(context.Background(), ip)
+}
+
+// LookupHostnameQuickCtx is LookupHostnameQuick bounded by ctx, so a caller
+// whose own budget expires is not left waiting on a dns-sd subprocess.
+func (r *Resolver) LookupHostnameQuickCtx(ctx context.Context, ip string) (hostname, source string) {
 	if c := r.cachedForIP(ip); c.Hostname != "" {
 		return c.Hostname, c.Source
 	}
-	if h := reverseDNSWithTimeout(ip, 1200*time.Millisecond); h != "" {
+	if h := reverseDNSWithTimeout(ctx, ip, 1200*time.Millisecond); h != "" {
 		r.rememberIPName(ip, h, NameSourceDNS)
 		return h, NameSourceDNS
 	}
 	return "", NameSourceNone
 }
 
-func reverseDNSWithTimeout(ip string, timeout time.Duration) string {
+func reverseDNSWithTimeout(parentCtx context.Context, ip string, timeout time.Duration) string {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	if timeout <= 0 {
 		timeout = 750 * time.Millisecond
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	// Split budget: unicast first, then mDNS PTR with remaining time (min 400ms).
@@ -147,13 +162,16 @@ func reverseDNSWithTimeout(ip string, timeout time.Duration) string {
 	if remaining < 400*time.Millisecond {
 		remaining = 400 * time.Millisecond
 	}
-	if name := mdnsReversePTR(ip, remaining); name != "" {
+	if name := mdnsReversePTR(ctx, ip, remaining); name != "" {
 		return name
 	}
 	return ""
 }
 
-func mdnsReversePTR(ip string, timeout time.Duration) string {
+func mdnsReversePTR(parentCtx context.Context, ip string, timeout time.Duration) string {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
 		return ""
@@ -167,7 +185,7 @@ func mdnsReversePTR(ip string, timeout time.Duration) string {
 	if timeout <= 0 {
 		timeout = 600 * time.Millisecond
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "dns-sd", "-q", ptr, "PTR")

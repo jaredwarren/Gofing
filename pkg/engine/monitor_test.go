@@ -10,42 +10,49 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
-func TestMonitorMarksOfflineAfterDebouncedMisses(t *testing.T) {
+func TestPresenceMarksOfflineAfterDebouncedMisses(t *testing.T) {
 	eng := New(nil)
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:50", LatencyMs: 1}, mdns.DeviceDetails{
 		Hostname: "cam",
 	}, "Unknown", time.Now(), nil)
 
 	var probes int32
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
 	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) {
 		atomic.AddInt32(&probes, 1)
 		return 0, false
 	}
 
-	eng.MonitorOnce(context.Background())
-	dev, _ := eng.GetDevice(id)
-	if !dev.IsOnline {
-		t.Fatal("should stay online after 1 miss")
+	// Presence and discovery used to keep two thresholds against one counter.
+	// There is now a single owner and a single threshold.
+	for i := 0; i < offlineMissThreshold-1; i++ {
+		eng.MonitorOnce(context.Background())
+		dev, _ := eng.GetDevice(id)
+		if !dev.IsOnline {
+			t.Fatalf("went offline after %d miss(es); threshold is %d", i+1, offlineMissThreshold)
+		}
 	}
 
 	eng.MonitorOnce(context.Background())
-	dev, _ = eng.GetDevice(id)
+	dev, _ := eng.GetDevice(id)
 	if dev.IsOnline {
-		t.Fatal("should be offline after 2 consecutive misses")
+		t.Fatalf("should be offline after %d consecutive misses", offlineMissThreshold)
 	}
-	if atomic.LoadInt32(&probes) < 2 {
-		t.Fatalf("probes=%d", probes)
+	if got := atomic.LoadInt32(&probes); got < int32(offlineMissThreshold) {
+		t.Fatalf("probes=%d, want at least %d", got, offlineMissThreshold)
 	}
 }
 
-func TestMonitorBringsDeviceOnline(t *testing.T) {
+func TestPresenceBringsDeviceOnline(t *testing.T) {
 	eng := New(nil)
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:51", LatencyMs: 1}, mdns.DeviceDetails{
 		Hostname: "cam",
 	}, "Unknown", time.Now(), nil)
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
 	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) { return 0, false }
-	eng.MonitorOnce(context.Background())
-	eng.MonitorOnce(context.Background())
+	for i := 0; i < offlineMissThreshold; i++ {
+		eng.MonitorOnce(context.Background())
+	}
 	dev, _ := eng.GetDevice(id)
 	if dev.IsOnline {
 		t.Fatal("expected offline")
@@ -62,20 +69,58 @@ func TestMonitorBringsDeviceOnline(t *testing.T) {
 	}
 }
 
-func TestMonitorSkipsWhenScanning(t *testing.T) {
+// TestPresenceRunsDuringDiscovery is the inversion of the old
+// TestMonitorSkipsWhenScanning. Presence deferring to a running sweep is
+// exactly the bug this split exists to fix: a sweep took ~20s of every 30s, so
+// online/offline detection was dead most of the time.
+func TestPresenceRunsDuringDiscovery(t *testing.T) {
 	eng := New(nil)
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:52"}, mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
-	called := false
+	var called atomic.Bool
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
 	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) {
-		called = true
+		called.Store(true)
 		return 1, true
 	}
-	eng.mu.Lock()
-	eng.isScanning = true
-	eng.mu.Unlock()
+
+	// Hold the discovery gate, as a sweep in progress would.
+	if !eng.discoveryGate.begin() {
+		t.Fatal("discovery gate should have been free")
+	}
+	defer eng.discoveryGate.end(time.Now())
+
 	eng.MonitorOnce(context.Background())
-	if called {
-		t.Fatal("must not probe during a full scan")
+	if !called.Load() {
+		t.Fatal("presence must keep probing while a discovery sweep runs")
+	}
+	if !eng.IsScanning() {
+		t.Fatal("IsScanning should report the in-flight discovery sweep")
+	}
+}
+
+func TestPresenceGateIsSingleFlight(t *testing.T) {
+	eng := New(nil)
+	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.60", MAC: "AA:BB:CC:DD:EE:60"}, mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
+	var probes atomic.Int32
+	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
+	eng.probeFn = func(ctx context.Context, ip string) (float64, bool) {
+		probes.Add(1)
+		return 1, true
+	}
+
+	// A tier never overlaps itself, even though it overlaps other tiers freely.
+	if !eng.presenceGate.begin() {
+		t.Fatal("presence gate should have been free")
+	}
+	eng.MonitorOnce(context.Background())
+	if probes.Load() != 0 {
+		t.Fatalf("a second concurrent presence pass ran; probes=%d", probes.Load())
+	}
+	eng.presenceGate.end(time.Now())
+
+	eng.MonitorOnce(context.Background())
+	if probes.Load() == 0 {
+		t.Fatal("presence should run once the gate is released")
 	}
 }
 

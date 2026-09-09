@@ -55,18 +55,59 @@ func (r *Resolver) SetNameLearnedHandler(fn NameLearnedFunc) {
 	r.onLearned = fn
 }
 
+// ResolveInput bundles everything fingerprinting needs to know about one host.
+type ResolveInput struct {
+	IP               string
+	MAC              string
+	Vendor           string
+	IsGateway        bool
+	HostComputerName string
+	ARPHostname      string
+}
+
+// GatewayDetails returns the fixed router fingerprint. Extracted from the
+// isGateway short-circuit so a caller can identify the gateway without probing.
+func GatewayDetails(vendor string) DeviceDetails {
+	return DeviceDetails{
+		Hostname:   "Network Gateway",
+		NameSource: NameSourceHost,
+		DeviceType: "Router",
+		Icon:       "router",
+		Model:      vendor + " Gateway",
+		Services:   []string{"Gateway", "DNS", "DHCP"},
+	}
+}
+
 // ResolveDevice performs multi-layer non-blocking fingerprinting.
 // arpHostname is an optional name from macOS `arp -a` (Bonjour cache).
 func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway bool, hostComputerName string, arpHostname string) DeviceDetails {
+	return r.ResolveDeviceCtx(context.Background(), ResolveInput{
+		IP:               ip,
+		MAC:              mac,
+		Vendor:           vendor,
+		IsGateway:        isGateway,
+		HostComputerName: hostComputerName,
+		ARPHostname:      arpHostname,
+	})
+}
+
+// ResolveDeviceCtx fingerprints one host, honouring ctx throughout.
+//
+// The three independent network probes — the iOS sync port, reverse DNS /
+// dns-sd PTR, and NetBIOS — run concurrently rather than in sequence. They
+// contend for nothing and their results are merged with the same precedence
+// as before, so the pass costs about as long as its slowest probe (~1.2s)
+// instead of their sum (~1.4s), and far less when a free source already
+// supplied the name.
+func (r *Resolver) ResolveDeviceCtx(ctx context.Context, in ResolveInput) DeviceDetails {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ip, mac, vendor := in.IP, in.MAC, in.Vendor
+	isGateway, hostComputerName, arpHostname := in.IsGateway, in.HostComputerName, in.ARPHostname
+
 	if isGateway {
-		return DeviceDetails{
-			Hostname:   "Network Gateway",
-			NameSource: NameSourceHost,
-			DeviceType: "Router",
-			Icon:       "router",
-			Model:      vendor + " Gateway",
-			Services:   []string{"Gateway", "DNS", "DHCP"},
-		}
+		return GatewayDetails(vendor)
 	}
 
 	hostname := ""
@@ -116,8 +157,47 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 		}
 	}
 
+	// The free sources above are what decide whether a name lookup is needed.
+	// The iOS probe never yields a hostname, so gating on `hostname` here is
+	// faithful to the original sequence.
+	needName := hostname == ""
+
+	var (
+		wg      sync.WaitGroup
+		isIOS   bool
+		dnsName string
+		dnsSrc  string
+		nbName  string
+	)
+
+	// iOS sync port: type/vendor hints only, never a hostname. Always worth the
+	// 40ms because it is the only signal that distinguishes an iPhone.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		isIOS = probeIOSSyncPortCtx(ctx, ip)
+	}()
+
+	if needName {
+		// Reverse DNS / dns-sd PTR — the slowest probe, ~1.2s.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			dnsName, dnsSrc = r.LookupHostnameQuickCtx(ctx, ip)
+		}()
+
+		// NetBIOS. Speculative: reverse DNS outranks it, so its answer is
+		// discarded when both succeed. Paying 80ms of UDP in parallel to avoid
+		// 80ms of added latency on Windows hosts is the right trade.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nbName = queryNetBIOSNameCtx(ctx, ip)
+		}()
+	}
+	wg.Wait()
+
 	// iOS probe contributes type/vendor hints only (not hostname)
-	isIOS := probeIOSSyncPort(ip)
 	if isIOS {
 		services = append(services, "iOS Wireless Sync")
 		if vendor == "Private / Randomized MAC" || strings.Contains(strings.ToLower(vendor), "apple") {
@@ -131,20 +211,16 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 	}
 
 	// Priority 3: Reverse DNS / dns-sd PTR (quick timeout during scans)
-	if hostname == "" {
-		if h, src := r.LookupHostnameQuick(ip); h != "" {
-			hostname = h
-			nameSource = src
-		}
+	if hostname == "" && dnsName != "" {
+		hostname = dnsName
+		nameSource = dnsSrc
 	}
 
 	// Priority 4: NetBIOS (Windows PCs) — cheap UDP probe, last resort
-	if hostname == "" {
-		if nbName := queryNetBIOSName(ip); nbName != "" {
-			hostname = nbName
-			nameSource = NameSourceARP
-			r.rememberIPName(ip, hostname, NameSourceARP)
-		}
+	if hostname == "" && nbName != "" {
+		hostname = nbName
+		nameSource = NameSourceARP
+		r.rememberIPName(ip, hostname, NameSourceARP)
 	}
 
 	inferredServices := inferServices(hostname, vendor)
@@ -169,7 +245,17 @@ func (r *Resolver) ResolveDevice(ip string, mac string, vendor string, isGateway
 
 // Ultra-fast TCP probe for iOS iTunes/Finder wireless sync listener port 62078 (40ms timeout)
 func probeIOSSyncPort(ip string) bool {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "62078"), 40*time.Millisecond)
+	return probeIOSSyncPortCtx(context.Background(), ip)
+}
+
+func probeIOSSyncPortCtx(ctx context.Context, ip string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "tcp", net.JoinHostPort(ip, "62078"))
 	if err == nil {
 		conn.Close()
 		return true
@@ -267,7 +353,17 @@ func isSaneHostname(name string) bool {
 }
 
 func queryNetBIOSName(ip string) string {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "137"), 80*time.Millisecond)
+	return queryNetBIOSNameCtx(context.Background(), ip)
+}
+
+func queryNetBIOSNameCtx(ctx context.Context, ip string) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "udp", net.JoinHostPort(ip, "137"))
 	if err != nil {
 		return ""
 	}

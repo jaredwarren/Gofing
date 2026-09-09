@@ -14,7 +14,6 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/notify"
-	"github.com/jaredwarren/Gofing/pkg/oui"
 	"github.com/jaredwarren/Gofing/pkg/ports"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
@@ -44,6 +43,11 @@ type Device struct {
 	OpenPorts          []ports.ServicePort `json:"open_ports,omitempty"`
 	RiskScore          string              `json:"risk_score,omitempty"` // none|low|medium|high
 	RiskFindings       []string            `json:"risk_findings,omitempty"`
+
+	// Tier-3 enrichment bookkeeping. A zero LastEnrichedAt means "never
+	// fingerprinted" and always qualifies for enrichment.
+	LastEnrichedAt time.Time `json:"last_enriched_at"`
+	EnrichFailures int       `json:"enrich_failures,omitempty"`
 }
 
 // DevicePatch is the set of user-editable fields (PATCH /api/devices/{id}).
@@ -62,28 +66,50 @@ const offlineMissThreshold = 3
 
 // Engine coordinates scanning, fingerprinting, and state management.
 type Engine struct {
-	mu               sync.RWMutex
-	devices          map[string]*Device // keyed by stable Device.ID
-	missCount        map[string]int     // consecutive scan misses per device ID
+	// mu guards the device map and everything derived from it. Never hold it
+	// across I/O; never emit or persist while holding it.
+	mu        sync.RWMutex
+	devices   map[string]*Device // keyed by stable Device.ID
+	missCount map[string]int     // consecutive scan misses per device ID
+
+	// settingsMu guards settings alone. Every tier timer reads it on each tick
+	// and fireAlert reads it on every transition, none of which concerns the
+	// device map — so it must not contend with the device writers.
+	settingsMu sync.RWMutex
+	settings   Settings
+
+	// listenersMu guards listeners alone. emitEvent reads it for every SSE frame.
+	listenersMu sync.RWMutex
+	listeners   []EventFunc
+
 	portScanMu       sync.Mutex
 	portScanInflight map[string]bool
 	netScanner       *scanner.Scanner
 	mdnsResolver     *mdns.Resolver
-	listeners        []EventFunc
-	isScanning       bool
 	persist          Persistence
 	warmHostFn       func(ip string)
 	deepLookupFn     func(r *mdns.Resolver, ip string) mdns.LookupResult
 	activeNetworkKey string
 	activeSubnetCIDR string
+	netInfo          *network.Info // cached active network; refreshed by currentNetInfo
+	netInfoAt        time.Time
 	discCtx          context.Context
-	isMonitoring     bool
-	settings         Settings
 	probeFn          func(ctx context.Context, ip string) (latency float64, ok bool)
 	arpFn            func(ctx context.Context) ([]scanner.RawDevice, error)
+	sweepFn          func(ctx context.Context, subnetCIDR, iface string, skipHits map[string]float64, progress func(int, int)) ([]scanner.RawDevice, error)
 	notifyFn         func(title, message string) error
-	scanGen          uint64 // incremented each PerformScan; monitor drops stale results
-	startupPresence  bool   // true until first probeKnown; suppresses launch online alerts
+	startupPresence  bool // true until the first presence pass; suppresses launch online alerts
+
+	// Per-tier single-flight gates. Different tiers overlap freely.
+	presenceGate  tierGate
+	discoveryGate tierGate
+	tiersOnce     sync.Once
+	lastPresence  PresenceResult // newest Tier-1 snapshot; feeds the sweep's skip list
+
+	// Tier 3: queue-driven fingerprinting.
+	enrichQ   *enrichQueue
+	resolveFn func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails
+	vendorFn  func(mac string) string
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -92,6 +118,7 @@ func New(persist Persistence) *Engine {
 		devices:          make(map[string]*Device),
 		missCount:        make(map[string]int),
 		portScanInflight: make(map[string]bool),
+		enrichQ:          newEnrichQueue(),
 		netScanner:       scanner.New(),
 		mdnsResolver:     mdns.New(),
 		persist:          persist,
@@ -126,7 +153,7 @@ func (e *Engine) Start(ctx context.Context, info *network.Info) {
 		e.SetActiveNetwork(info)
 		e.listenMDNS(info.InterfaceName)
 	}
-	go e.RunMonitor(ctx)
+	e.StartTiers(ctx)
 }
 
 // SetNotifyFn overrides the notification delivery function.
@@ -194,6 +221,13 @@ func (e *Engine) loadFromStore() {
 		if d.Hostname == "" {
 			d.NameSource = mdns.NameSourceNone
 		}
+		// Rows persisted before enrichment existed have no LastEnrichedAt. Treat
+		// an already-identified device's last sighting as its last fingerprint so
+		// the TTL staggers them instead of flushing the whole inventory into the
+		// queue on the first start after an upgrade.
+		if d.LastEnrichedAt.IsZero() && d.Hostname != "" && d.DeviceType != "" {
+			d.LastEnrichedAt = d.LastSeen
+		}
 		cp := d
 		e.devices[cp.ID] = &cp
 	}
@@ -201,16 +235,16 @@ func (e *Engine) loadFromStore() {
 
 // RegisterEventListener adds a subscriber for scan events.
 func (e *Engine) RegisterEventListener(fn EventFunc) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.listenersMu.Lock()
+	defer e.listenersMu.Unlock()
 	e.listeners = append(e.listeners, fn)
 }
 
 func (e *Engine) emitEvent(eventType string, data interface{}) {
-	e.mu.RLock()
+	e.listenersMu.RLock()
 	listeners := make([]EventFunc, len(e.listeners))
 	copy(listeners, e.listeners)
-	e.mu.RUnlock()
+	e.listenersMu.RUnlock()
 
 	for _, l := range listeners {
 		l(eventType, data)
@@ -269,6 +303,8 @@ func (e *Engine) setActiveNetworkLocked(info *network.Info) {
 	e.activeSubnetCIDR = ""
 	if info != nil {
 		e.activeSubnetCIDR = info.SubnetCIDR
+		e.netInfo = info
+		e.netInfoAt = time.Now()
 	}
 	if prev != "" && e.activeNetworkKey != "" && prev != e.activeNetworkKey {
 		// Drop miss counters for the previous LAN; they are not offline on this network.
@@ -470,6 +506,25 @@ func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
 	return res, nil
 }
 
+// UpsertForTest seeds a device through the normal identity rules. Exported so
+// tests in other packages can build a realistic inventory.
+func (e *Engine) UpsertForTest(raw scanner.RawDevice, details mdns.DeviceDetails,
+	vendor string, now time.Time) string {
+	return e.upsertDevice(raw, details, vendor, now, nil)
+}
+
+// SetEnrichTestHooks overrides the Tier-3 network probes so enrichment can be
+// exercised without touching the network. Either may be nil to keep the real one.
+func (e *Engine) SetEnrichTestHooks(
+	resolve func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails,
+	vendor func(mac string) string,
+) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.resolveFn = resolve
+	e.vendorFn = vendor
+}
+
 // SetTestHooks configures custom network lookup functions for unit testing.
 func (e *Engine) SetTestHooks(warmHost func(ip string), deepLookup func(r *mdns.Resolver, ip string) mdns.LookupResult) {
 	e.mu.Lock()
@@ -623,198 +678,32 @@ func (e *Engine) ListDeviceHistory(id string, limit int) ([]Event, error) {
 	return e.persist.ListEvents(id, limit)
 }
 
-// IsScanning returns true if a scan is currently running.
+// IsScanning reports whether a discovery sweep is in flight. Presence and
+// enrichment run continuously and are reported separately via TierStatus.
 func (e *Engine) IsScanning() bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.isScanning
+	return e.discoveryGate.running()
 }
 
-// PerformScan executes a complete network discovery pass.
-func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Device, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	e.mu.Lock()
-	if e.isScanning {
-		e.mu.Unlock()
-		return e.GetDevices(), nil
-	}
-	e.isScanning = true
-	e.scanGen++
-	e.mu.Unlock()
-
-	defer func() {
-		e.mu.Lock()
-		e.isScanning = false
-		e.mu.Unlock()
-	}()
-
-	e.emitEvent("scan_start", map[string]string{
-		"subnet":      netInfo.SubnetCIDR,
-		"ssid":        netInfo.SSID,
-		"network_key": NetworkKeyFromInfo(netInfo),
-	})
-
-	e.mu.Lock()
-	prevKey := e.activeNetworkKey
-	e.setActiveNetworkLocked(netInfo)
-	netChanged := prevKey != "" && prevKey != e.activeNetworkKey
-	e.mu.Unlock()
-	if netChanged {
-		e.emitEvent("network_changed", map[string]interface{}{
-			"network_key": NetworkKeyFromInfo(netInfo),
-			"ssid":        netInfo.SSID,
-			"subnet":      netInfo.SubnetCIDR,
-			"devices":     e.GetDevices(),
-		})
-	}
-	if netInfo != nil {
-		e.listenMDNS(netInfo.InterfaceName)
-	}
-
-	skipHits, confirmedIDs := e.probeKnown(ctx, netInfo)
-
-	rawDevices, err := e.netScanner.PerformScan(ctx, netInfo.SubnetCIDR, netInfo.InterfaceName, skipHits, func(current, total int) {
-		e.emitEvent("scan_progress", map[string]int{
-			"scanned": current,
-			"total":   total,
-		})
-	})
-	if err != nil {
-		e.emitEvent("scan_error", err.Error())
-		return nil, err
-	}
-
-	now := time.Now()
-	wasOnline := make(map[string]bool)
-
-	e.mu.Lock()
-	for id, dev := range e.devices {
-		wasOnline[id] = dev.IsOnline
-	}
-	e.mu.Unlock()
-
-	seenIDs := make(map[string]bool)
-	for id := range confirmedIDs {
-		seenIDs[id] = true
-	}
-	var seenMu sync.Mutex
-
-	var wg sync.WaitGroup
-	deviceChan := make(chan scanner.RawDevice, len(rawDevices))
-	for _, raw := range rawDevices {
-		deviceChan <- raw
-	}
-	close(deviceChan)
-
-	concurrency := 8 // keep low so reverse-DNS/mDNS during fingerprinting stays reliable
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for raw := range deviceChan {
-				isGateway := raw.IP == netInfo.GatewayIP
-				isHost := raw.IP == netInfo.IP || (raw.MAC != "" && strings.EqualFold(raw.MAC, netInfo.MAC))
-				macVendor := oui.LookupVendor(raw.MAC)
-
-				hostCompName := ""
-				if isHost {
-					hostCompName = netInfo.ComputerName
-				}
-
-				details := e.mdnsResolver.ResolveDevice(raw.IP, raw.MAC, macVendor, isGateway, hostCompName, raw.Hostname)
-				id := e.upsertDevice(raw, details, macVendor, now, wasOnline)
-				if id != "" {
-					seenMu.Lock()
-					seenIDs[id] = true
-					seenMu.Unlock()
-				}
-			}
-		}()
-	}
-
-	wg.Wait()
-
-	// Browse runs in the background during the ping sweep. Apply any names
-	// learned after a device was fingerprinted so the first scan still
-	// gets Bonjour hostnames (macOS arp -a almost never has them).
-	e.applyCachedHostnames()
-
-	// Apply offline debounce for devices not seen this scan.
-	wentOffline, toPersist := e.applyMisses(seenIDs, wasOnline)
-
-	for _, d := range wentOffline {
-		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
-		e.emitEvent("device_offline", d)
-		e.emitEvent("device_updated", d)
-		e.fireAlert("device_offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
-	}
-	for _, d := range toPersist {
-		e.persistDevice(d)
-	}
-
-	finalList := e.GetDevices()
-	e.emitEvent("scan_complete", map[string]interface{}{
-		"total_devices": len(finalList),
-		"devices":       finalList,
-		"network_key":   NetworkKeyFromInfo(netInfo),
-		"timestamp":     now.Format(time.RFC3339),
-	})
-
-	return finalList, nil
+// upsertOpts controls the side effects of a single upsert. Making these
+// explicit replaces an unsynchronized read of isScanning that used to decide,
+// invisibly, whether a caller was responsible for persisting.
+type upsertOpts struct {
+	Persist    bool // false when the caller batch-persists the whole pass afterwards
+	EmitFound  bool
+	EmitUpdate bool
 }
 
-// applyCachedHostnames upgrades in-memory hostnames from the background mDNS
-// browse cache. macOS `arp -a` returns "?" for nearly every host, so Bonjour
-// names often arrive only after fingerprinting has already run.
-func (e *Engine) applyCachedHostnames() {
-	if e.mdnsResolver == nil {
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for _, d := range e.devices {
-		if d.IP == "" {
-			continue
-		}
-		name, src := e.mdnsResolver.CachedName(d.IP)
-		if name == "" {
-			continue
-		}
-		d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, name, src)
-	}
-}
-
-// applyMisses increments miss counters for devices absent from this scan and
-// marks them offline only after offlineMissThreshold consecutive misses.
-// Devices on other networks are ignored (they are not offline — just not here).
-func (e *Engine) applyMisses(seenIDs, wasOnline map[string]bool) (wentOffline, toPersist []Device) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	for id, dev := range e.devices {
-		if !e.belongsToActiveNetworkLocked(dev) {
-			continue
-		}
-		if seenIDs[id] {
-			e.missCount[id] = 0
-			toPersist = append(toPersist, *dev)
-			continue
-		}
-		e.missCount[id]++
-		if e.missCount[id] >= offlineMissThreshold && dev.IsOnline {
-			dev.IsOnline = false
-			wentOffline = append(wentOffline, *dev)
-		}
-		toPersist = append(toPersist, *dev)
-	}
-	return wentOffline, toPersist
-}
-
-// upsertDevice merges a scanned host into inventory using stable identity rules.
-// Returns the stable device ID. Caller must NOT hold e.mu.
+// upsertDevice merges a scanned host into inventory using stable identity rules,
+// persisting and emitting immediately. Returns the stable device ID.
+// Caller must NOT hold e.mu.
 func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time, wasOnline map[string]bool) string {
+	return e.upsertDeviceOpts(raw, details, macVendor, now, wasOnline,
+		upsertOpts{Persist: true, EmitFound: true, EmitUpdate: true})
+}
+
+// upsertDeviceOpts is upsertDevice with explicit control over persistence and
+// event emission. Caller must NOT hold e.mu.
+func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDetails, macVendor string, now time.Time, wasOnline map[string]bool, opts upsertOpts) string {
 	normMAC := NormalizeMAC(raw.MAC)
 	private := IsPrivateMAC(normMAC)
 
@@ -849,11 +738,13 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		out := *newDev
 		e.mu.Unlock()
 
-		if !e.isScanning {
+		if opts.Persist {
 			e.persistDevice(out)
 		}
 		e.recordEvent("found", out.ID, fmt.Sprintf("Discovered %s (%s)", out.DisplayName(), out.IP))
-		e.emitEvent("device_found", &out)
+		if opts.EmitFound {
+			e.emitEvent("device_found", &out)
+		}
 		e.fireAlert("new_device", out.ID, fmt.Sprintf("New device: %s (%s)", out.DisplayName(), out.IP))
 		if out.Hostname == "" {
 			go e.backgroundNameResolve(out.ID)
@@ -862,6 +753,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 	}
 
 	oldID := existing.ID
+	beforeUpsert := *existing
 	wasPreviouslyOnline := existing.IsOnline
 	if wasOnline != nil {
 		wasPreviouslyOnline = wasOnline[existing.ID]
@@ -903,19 +795,7 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 		e.devices[desiredID] = existing
 	}
 
-	if details.Hostname != "" || details.NameSource != "" {
-		existing.Hostname, existing.NameSource = mdns.PreferHostname(
-			existing.Hostname, existing.NameSource,
-			details.Hostname, details.NameSource,
-		)
-	}
-	// Model/type are fingerprint hints only — never written into Hostname.
-	if details.DeviceType != "" {
-		existing.DeviceType = details.DeviceType
-		existing.Icon = details.Icon
-		existing.Model = details.Model
-	}
-	existing.Services = details.Services
+	applyDetailsLocked(existing, details, "")
 	e.missCount[existing.ID] = 0
 	if oldID != existing.ID {
 		if wasOnline != nil {
@@ -934,8 +814,9 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 
 	if migratedFrom != "" {
 		e.deletePersisted(migratedFrom)
+		e.enrichQ.rekey(migratedFrom, out.ID)
 	}
-	if !e.isScanning {
+	if opts.Persist {
 		e.persistDevice(out)
 	}
 	if cameOnline {
@@ -945,8 +826,65 @@ func (e *Engine) upsertDevice(raw scanner.RawDevice, details mdns.DeviceDetails,
 			go e.backgroundNameResolve(out.ID)
 		}
 	}
-	e.emitEvent("device_updated", &out)
+	if opts.EmitUpdate && (cameOnline || migratedFrom != "" ||
+		deviceChangedMeaningfully(beforeUpsert, out)) {
+		e.emitEvent("device_updated", &out)
+	}
 	return out.ID
+}
+
+// applyDetailsLocked merges resolved fingerprint details into d using the ranked
+// name rules. Caller must hold e.mu, and must emit and persist only after
+// unlocking. An empty vendor leaves d.Vendor alone. Returns true if any
+// user-visible field changed.
+//
+// Both the discovery sweep and the enrichment tier merge through here, so the
+// precedence rules exist in exactly one place.
+func applyDetailsLocked(d *Device, details mdns.DeviceDetails, vendor string) bool {
+	before := *d
+
+	if details.Hostname != "" || details.NameSource != "" {
+		d.Hostname, d.NameSource = mdns.PreferHostname(
+			d.Hostname, d.NameSource,
+			details.Hostname, details.NameSource,
+		)
+	}
+	// Model/type are fingerprint hints only — never written into Hostname.
+	if details.DeviceType != "" {
+		d.DeviceType = details.DeviceType
+		d.Icon = details.Icon
+		d.Model = details.Model
+	}
+	// A probe that timed out returns no services; that is not evidence the
+	// device stopped offering the ones we already know about.
+	if len(details.Services) > 0 {
+		d.Services = details.Services
+	}
+	// Likewise, a local-only vendor miss must not erase a known vendor.
+	if vendor != "" {
+		d.Vendor = vendor
+	}
+
+	return before.Hostname != d.Hostname ||
+		before.NameSource != d.NameSource ||
+		before.DeviceType != d.DeviceType ||
+		before.Icon != d.Icon ||
+		before.Model != d.Model ||
+		before.Vendor != d.Vendor ||
+		!sameStrings(before.Services, d.Services)
+}
+
+// sameStrings reports whether two string slices hold the same values in order.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.

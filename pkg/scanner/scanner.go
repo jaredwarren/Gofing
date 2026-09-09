@@ -27,7 +27,24 @@ type RawDevice struct {
 }
 
 // Scanner handles IP ping sweeps and macOS ARP cache extraction.
-type Scanner struct{}
+type Scanner struct {
+	// Cached `arp` parses, kept separately for the numeric and name-resolving
+	// forms because they cost three orders of magnitude apart. A pass used to
+	// exec arp two or three times within a couple of seconds; the kernel table
+	// does not change meaningfully at that granularity.
+	arpMu      sync.Mutex
+	arpNumeric arpCache
+	arpNamed   arpCache
+
+	// arpExecFn overrides the `arp` exec for tests. numeric mirrors the flag
+	// the real implementation would have used.
+	arpExecFn func(ctx context.Context, numeric bool) ([]RawDevice, error)
+}
+
+type arpCache struct {
+	rows []RawDevice
+	at   time.Time
+}
 
 // New returns a new Scanner instance.
 func New() *Scanner {
@@ -56,7 +73,10 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, ski
 	applySkipHits(pingResults, skipHits)
 
 	arpByIP := make(map[string]RawDevice)
-	arpDevices, err := s.parsemacOSARPTable(ctx)
+	// Fresh exec: the sweep above is what provoked these ARP entries. Numeric,
+	// because a ten-second reverse-resolve pass would dominate the sweep and
+	// the enrichment tier resolves names properly anyway.
+	arpDevices, err := s.ARPTableNumeric(ctx, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse ARP table: %w", err)
 	}
@@ -67,9 +87,60 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, ski
 	return mergeProbeAndARP(pingResults, arpByIP, subnetCIDR, iface, time.Now()), nil
 }
 
-// ARPTable returns complete rows from macOS `arp -a`.
+// ARPTable returns rows from macOS `arp -an`, always freshly exec'd.
 func (s *Scanner) ARPTable(ctx context.Context) ([]RawDevice, error) {
-	return s.parsemacOSARPTable(ctx)
+	return s.ARPTableNumeric(ctx, 0)
+}
+
+// ARPTableNumeric returns `arp -an` rows: IP, MAC and interface, with no
+// hostnames. This is the form to use for presence and sweeps.
+//
+// `arp -a` reverse-resolves every entry, which on a /24 with mostly
+// unresolvable addresses takes ten seconds or more — versus about ten
+// milliseconds for `-an`. Layer-2 presence does not need names, and since
+// enrichment now resolves names properly, nothing else has to pay that cost.
+func (s *Scanner) ARPTableNumeric(ctx context.Context, maxAge time.Duration) ([]RawDevice, error) {
+	return s.arpTable(ctx, maxAge, true)
+}
+
+// ARPTableCached returns `arp -a` rows, including the Bonjour hostnames macOS
+// has cached, reusing a previous result when it is newer than maxAge.
+//
+// This form is slow — it reverse-resolves every entry. Use it only when a
+// hostname is the point; prefer ARPTableNumeric otherwise.
+func (s *Scanner) ARPTableCached(ctx context.Context, maxAge time.Duration) ([]RawDevice, error) {
+	return s.arpTable(ctx, maxAge, false)
+}
+
+func (s *Scanner) arpTable(ctx context.Context, maxAge time.Duration, numeric bool) ([]RawDevice, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.arpMu.Lock()
+	defer s.arpMu.Unlock()
+
+	cache := &s.arpNamed
+	if numeric {
+		cache = &s.arpNumeric
+	}
+	if maxAge > 0 && !cache.at.IsZero() && time.Since(cache.at) < maxAge {
+		out := make([]RawDevice, len(cache.rows))
+		copy(out, cache.rows)
+		return out, nil
+	}
+
+	exec := s.arpExecFn
+	if exec == nil {
+		exec = s.parsemacOSARPTable
+	}
+	rows, err := exec(ctx, numeric)
+	if err != nil {
+		return nil, err
+	}
+	cache.rows = make([]RawDevice, len(rows))
+	copy(cache.rows, rows)
+	cache.at = time.Now()
+	return rows, nil
 }
 
 func filterSkippedIPs(ips []string, skipHits map[string]float64) []string {
@@ -264,18 +335,12 @@ func probeTCPParallel(ctx context.Context, ip string, timeout time.Duration) boo
 }
 
 func pingIPFast(ctx context.Context, ip string) (float64, bool) {
-	// TCP probes first — moderately patient to avoid Wi‑Fi false negatives.
+	// TCP probes first, all ports at once. Dialing them in sequence cost ~800ms
+	// per unreachable host — the dominant term in a /24 sweep — for no more
+	// coverage than a single parallel fan-out with a slightly longer timeout.
 	start := time.Now()
-
-	for _, port := range commonTCPPorts {
-		var d net.Dialer
-		d.Timeout = 100 * time.Millisecond
-		conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
-		if err == nil {
-			conn.Close()
-			lat := float64(time.Since(start).Microseconds()) / 1000.0
-			return lat, true
-		}
+	if probeTCPParallel(ctx, ip, 150*time.Millisecond) {
+		return float64(time.Since(start).Microseconds()) / 1000.0, true
 	}
 
 	// ICMP with one retry. macOS ping -W is milliseconds to wait for a reply.
@@ -331,12 +396,17 @@ func parsePingLatency(output string) float64 {
 // Use `arp -a` (not -an) so Bonjour names are present when macOS knows them.
 var arpLineRe = regexp.MustCompile(`^(\S+)\s+\(([\d.]+)\)\s+at\s+([0-9a-fA-F:]+)\s+on\s+(\w+)`)
 
-func (s *Scanner) parsemacOSARPTable(ctx context.Context) ([]RawDevice, error) {
+func (s *Scanner) parsemacOSARPTable(ctx context.Context, numeric bool) ([]RawDevice, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// `-a` (not `-n`) includes mDNS/Bonjour hostnames when cached.
-	cmd := exec.CommandContext(ctx, "arp", "-a")
+	// `-a` includes mDNS/Bonjour hostnames when macOS has them cached, at the
+	// cost of a reverse lookup per entry. `-an` skips both.
+	args := []string{"-a"}
+	if numeric {
+		args = []string{"-an"}
+	}
+	cmd := exec.CommandContext(ctx, "arp", args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
@@ -349,7 +419,7 @@ func (s *Scanner) parsemacOSARPTable(ctx context.Context) ([]RawDevice, error) {
 
 // ARPHostname returns the Bonjour/mDNS name for ip from `arp -a`, if present.
 func (s *Scanner) ARPHostname(ip string) string {
-	devices, err := s.parsemacOSARPTable(context.Background())
+	devices, err := s.ARPTableCached(context.Background(), 2*time.Second)
 	if err != nil {
 		return ""
 	}

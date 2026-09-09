@@ -79,10 +79,20 @@ func (s *Server) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"devices":     devices,
 		"is_scanning": s.devEngine.IsScanning(),
+		"tiers":       s.devEngine.TierStatus(),
 	})
 }
 
-// handleDeviceSubpath serves /api/devices/{id} and /api/devices/{id}/history.
+// deviceActions are the recognized /api/devices/{id}/<action> suffixes.
+var deviceActions = map[string]bool{
+	"history":      true,
+	"rdns":         true,
+	"resolve-name": true,
+	"portscan":     true,
+	"enrich":       true,
+}
+
+// handleDeviceSubpath serves /api/devices/{id} and /api/devices/{id}/<action>.
 func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/devices/")
 	path = strings.Trim(path, "/")
@@ -91,14 +101,21 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.Split(path, "/")
-	id := parts[0]
+	// A scoped device ID contains a slash — "ssid:Home/AA:BB:CC:DD:EE:FF" — so
+	// the ID cannot be assumed to be a single path segment. Split on the known
+	// action suffix instead and treat everything before it as the ID.
+	id, action := path, ""
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		if candidate := path[i+1:]; deviceActions[candidate] {
+			id, action = path[:i], candidate
+		}
+	}
 	if id == "" {
 		http.Error(w, "device id required", http.StatusBadRequest)
 		return
 	}
 
-	if len(parts) == 1 {
+	if action == "" {
 		switch r.Method {
 		case http.MethodPatch:
 			s.handlePatchDevice(w, r, id)
@@ -115,7 +132,7 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) == 2 && parts[1] == "history" {
+	if action == "history" {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -124,7 +141,7 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) == 2 && parts[1] == "rdns" {
+	if action == "rdns" {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -133,7 +150,7 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) == 2 && parts[1] == "resolve-name" {
+	if action == "resolve-name" {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -142,7 +159,7 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(parts) == 2 && parts[1] == "portscan" {
+	if action == "portscan" {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -151,7 +168,34 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if action == "enrich" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleEnrich(w, r, id)
+		return
+	}
+
 	http.NotFound(w, r)
+}
+
+// handleEnrich queues a fingerprint refresh. The work runs on the enrichment
+// tier, so this returns as soon as the job is accepted.
+func (s *Server) handleEnrich(w http.ResponseWriter, r *http.Request, id string) {
+	queued, err := s.devEngine.RequestEnrichment(id, engine.EnrichReasonManual)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	status := "enrich_started"
+	if !queued {
+		status = "already_running"
+	}
+	writeJSON(w, map[string]string{
+		"status": status,
+		"id":     id,
+	})
 }
 
 func (s *Server) handlePatchDevice(w http.ResponseWriter, r *http.Request, id string) {

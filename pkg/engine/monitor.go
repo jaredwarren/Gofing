@@ -2,161 +2,33 @@ package engine
 
 import (
 	"context"
-	"fmt"
-	"sync"
+	"log/slog"
 	"time"
-
-	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
-const monitorMissThreshold = 2
-
-// RunMonitor probes known devices between full subnet scans until ctx is cancelled.
+// RunMonitor runs the presence tier until ctx is cancelled.
+//
+// Deprecated: prefer StartTiers, which runs presence, discovery and enrichment
+// together. Retained because it is the shape existing callers expect.
 func (e *Engine) RunMonitor(ctx context.Context) {
 	if ctx == nil {
 		return
 	}
-	timer := time.NewTimer(e.monitorInterval())
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			e.MonitorOnce(ctx)
-			timer.Reset(e.monitorInterval())
-		}
-	}
+	e.presenceLoop(ctx)
+}
+
+// MonitorOnce runs a single presence pass. It no longer defers to a running
+// scan: presence is Tier 1 and must answer on its own cadence.
+func (e *Engine) MonitorOnce(ctx context.Context) {
+	e.PresenceOnce(ctx, e.currentNetInfo(30*time.Second))
 }
 
 func (e *Engine) monitorInterval() time.Duration {
-	e.mu.RLock()
+	e.settingsMu.RLock()
 	sec := e.settings.MonitorIntervalSec
-	e.mu.RUnlock()
-	if sec <= 0 {
-		sec = 10
-	}
-	return time.Duration(sec) * time.Second
-}
-
-// MonitorOnce checks reachability of known devices on the active network.
-func (e *Engine) MonitorOnce(ctx context.Context) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if e.IsScanning() {
-		return
-	}
-
-	e.mu.Lock()
-	if e.isMonitoring || e.isScanning {
-		e.mu.Unlock()
-		return
-	}
-	e.isMonitoring = true
-	gen := e.scanGen
-	e.mu.Unlock()
-	defer func() {
-		e.mu.Lock()
-		e.isMonitoring = false
-		e.mu.Unlock()
-	}()
-
-	type target struct {
-		id, ip string
-	}
-	e.mu.RLock()
-	var targets []target
-	for _, d := range e.devices {
-		if !e.deviceVisibleLocked(d) || d.IP == "" {
-			continue
-		}
-		targets = append(targets, target{id: d.ID, ip: d.IP})
-	}
-	e.mu.RUnlock()
-	if len(targets) == 0 {
-		return
-	}
-
-	type hit struct {
-		id  string
-		lat float64
-		ok  bool
-	}
-	results := make([]hit, len(targets))
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i, t := range targets {
-		wg.Add(1)
-		go func(i int, t target) {
-			defer wg.Done()
-			select {
-			case <-ctx.Done():
-				results[i] = hit{id: t.id}
-				return
-			case sem <- struct{}{}:
-			}
-			defer func() { <-sem }()
-			lat, ok := e.probeIP(ctx, t.ip)
-			results[i] = hit{id: t.id, lat: lat, ok: ok}
-		}(i, t)
-	}
-	wg.Wait()
-
-	now := time.Now()
-	var cameOnline, wentOffline []Device
-
-	e.mu.Lock()
-	if e.isScanning || e.scanGen != gen {
-		e.mu.Unlock()
-		return
-	}
-	for _, r := range results {
-		d, ok := e.devices[r.id]
-		if !ok {
-			continue
-		}
-		if r.ok {
-			e.missCount[r.id] = 0
-			wasOff := !d.IsOnline
-			d.IsOnline = true
-			d.LastSeen = now
-			d.LatencyMs = r.lat
-			if wasOff {
-				cameOnline = append(cameOnline, *d)
-			}
-			continue
-		}
-		e.missCount[r.id]++
-		if e.missCount[r.id] >= monitorMissThreshold && d.IsOnline {
-			d.IsOnline = false
-			wentOffline = append(wentOffline, *d)
-		}
-	}
-	e.mu.Unlock()
-
-	for i := range cameOnline {
-		d := cameOnline[i]
-		e.persistDevice(d)
-		e.recordEvent("online", d.ID, fmt.Sprintf("%s is online", d.DisplayName()))
-		e.emitEvent("device_updated", &d)
-		e.fireAlert("device_online", d.ID, fmt.Sprintf("%s came back online", d.DisplayName()))
-	}
-	for i := range wentOffline {
-		d := wentOffline[i]
-		e.persistDevice(d)
-		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
-		e.emitEvent("device_offline", d)
-		e.emitEvent("device_updated", d)
-		e.fireAlert("device_offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
-	}
-}
-
-func (e *Engine) probeIP(ctx context.Context, ip string) (float64, bool) {
-	if e.probeFn != nil {
-		return e.probeFn(ctx, ip)
-	}
-	return scanner.ProbeIP(ctx, ip)
+	e.settingsMu.RUnlock()
+	return time.Duration(clampInterval(sec, presenceIntervalMin, presenceIntervalMax,
+		DefaultSettings().MonitorIntervalSec)) * time.Second
 }
 
 func (e *Engine) loadSettings() {
@@ -167,32 +39,61 @@ func (e *Engine) loadSettings() {
 	if err != nil {
 		return
 	}
+	defaults := DefaultSettings()
 	if s.MonitorIntervalSec == 0 {
-		s.MonitorIntervalSec = 10
+		s.MonitorIntervalSec = defaults.MonitorIntervalSec
 	}
 	if s.ScanIntervalSec == 0 {
-		s.ScanIntervalSec = 30
+		s.ScanIntervalSec = defaults.ScanIntervalSec
 	}
-	e.mu.Lock()
+	if s.EnrichTTLSec == 0 {
+		s.EnrichTTLSec = defaults.EnrichTTLSec
+	}
+	// ScanIntervalSec used to be stored but unread, so existing databases hold
+	// the old 30s scan cadence. It now drives the full-subnet sweep, where 30s
+	// would be far too aggressive.
+	migrated := false
+	if s.ScanIntervalSec < discoveryIntervalMin {
+		slog.Info("migrating stored scan interval to the discovery sweep cadence",
+			"was_sec", s.ScanIntervalSec, "now_sec", defaults.ScanIntervalSec)
+		s.ScanIntervalSec = defaults.ScanIntervalSec
+		migrated = true
+	}
+
+	e.settingsMu.Lock()
 	e.settings = s
-	e.mu.Unlock()
+	e.settingsMu.Unlock()
+
+	if migrated {
+		if err := e.persist.SetSettings(s); err != nil {
+			slog.Warn("failed to persist migrated scan interval", "error", err)
+		}
+	}
 }
 
 // GetSettings returns a copy of current runtime settings.
 func (e *Engine) GetSettings() Settings {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.settingsMu.RLock()
+	defer e.settingsMu.RUnlock()
 	return e.settings
 }
 
 // UpdateSettings applies a partial settings patch and persists it.
 func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
-	e.mu.Lock()
+	defaults := DefaultSettings()
+
+	e.settingsMu.Lock()
 	if patch.ScanIntervalSec != nil && *patch.ScanIntervalSec > 0 {
-		e.settings.ScanIntervalSec = *patch.ScanIntervalSec
+		e.settings.ScanIntervalSec = clampInterval(*patch.ScanIntervalSec,
+			discoveryIntervalMin, discoveryIntervalMax, defaults.ScanIntervalSec)
 	}
 	if patch.MonitorIntervalSec != nil && *patch.MonitorIntervalSec > 0 {
-		e.settings.MonitorIntervalSec = *patch.MonitorIntervalSec
+		e.settings.MonitorIntervalSec = clampInterval(*patch.MonitorIntervalSec,
+			presenceIntervalMin, presenceIntervalMax, defaults.MonitorIntervalSec)
+	}
+	if patch.EnrichTTLSec != nil && *patch.EnrichTTLSec > 0 {
+		e.settings.EnrichTTLSec = clampInterval(*patch.EnrichTTLSec,
+			enrichTTLMin, enrichTTLMax, defaults.EnrichTTLSec)
 	}
 	if patch.AlertsEnabled != nil {
 		e.settings.AlertsEnabled = *patch.AlertsEnabled
@@ -201,7 +102,7 @@ func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
 		e.settings.NotifymacOS = *patch.NotifymacOS
 	}
 	out := e.settings
-	e.mu.Unlock()
+	e.settingsMu.Unlock()
 
 	if e.persist != nil {
 		if err := e.persist.SetSettings(out); err != nil {
@@ -212,9 +113,12 @@ func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
 }
 
 func (e *Engine) fireAlert(rule, deviceID, message string) {
-	e.mu.RLock()
+	e.settingsMu.RLock()
 	enabled := e.settings.AlertsEnabled
 	desktop := e.settings.NotifymacOS
+	e.settingsMu.RUnlock()
+
+	e.mu.RLock()
 	notifyFn := e.notifyFn
 	e.mu.RUnlock()
 	if !enabled {
