@@ -6,6 +6,46 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/ports"
 )
 
+// SSE / listener payloads for structured scan events. Device and Alert events
+// already pass those types directly.
+
+type ScanStartEvent struct {
+	Subnet     string `json:"subnet"`
+	SSID       string `json:"ssid"`
+	NetworkKey string `json:"network_key"`
+}
+
+type NetworkChangedEvent struct {
+	NetworkKey string   `json:"network_key"`
+	SSID       string   `json:"ssid"`
+	Subnet     string   `json:"subnet"`
+	Devices    []Device `json:"devices"`
+}
+
+type ScanProgressEvent struct {
+	Scanned int `json:"scanned"`
+	Total   int `json:"total"`
+}
+
+type ScanCompleteEvent struct {
+	TotalDevices int      `json:"total_devices"`
+	Devices      []Device `json:"devices"`
+	NetworkKey   string   `json:"network_key"`
+	Timestamp    string   `json:"timestamp"`
+}
+
+type PortScanCompleteEvent struct {
+	ID        string              `json:"id"`
+	Mode      string              `json:"mode"`
+	OpenPorts []ports.ServicePort `json:"open_ports"`
+}
+
+type PortScanErrorEvent struct {
+	ID    string `json:"id"`
+	Mode  string `json:"mode"`
+	Error string `json:"error"`
+}
+
 // deviceChangedMeaningfully reports whether a UI-visible field differs between
 // two snapshots of a device.
 //

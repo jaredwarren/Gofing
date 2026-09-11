@@ -26,8 +26,7 @@ var netbiosNodeStatusReq = []byte{
 	0x00, 0x01, // Class: IN (1)
 }
 
-// ParseNetBIOSResponse parses an RFC 1002 Node Status response payload.
-func ParseNetBIOSResponse(data []byte) (*NetBIOSInfo, error) {
+func parseNetBIOSResponse(data []byte) (*NetBIOSInfo, error) {
 	if len(data) < 56 {
 		return nil, fmt.Errorf("response too short: %d bytes", len(data))
 	}
@@ -96,8 +95,7 @@ func ParseNetBIOSResponse(data []byte) (*NetBIOSInfo, error) {
 	return info, nil
 }
 
-// ProbeNetBIOS sends an RFC 1002 Node Status query to target IP on UDP 137.
-func ProbeNetBIOS(ctx context.Context, ip string) (*NetBIOSInfo, error) {
+func probeNetBIOS(ctx context.Context, ip string) (*NetBIOSInfo, error) {
 	target := net.JoinHostPort(ip, "137")
 	conn, err := net.DialTimeout("udp", target, 750*time.Millisecond)
 	if err != nil {
@@ -121,5 +119,5 @@ func ProbeNetBIOS(ctx context.Context, ip string) (*NetBIOSInfo, error) {
 		return nil, err
 	}
 
-	return ParseNetBIOSResponse(buf[:n])
+	return parseNetBIOSResponse(buf[:n])
 }

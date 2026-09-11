@@ -127,7 +127,7 @@ func main() {
 	}
 	go pollDHCP(ctx, devEngine, dhcp.Source{File: dhcpFile, URL: *dhcpURLFlag}, *dhcpIntervalFlag)
 
-	staticFS, err := web.GetStaticFS()
+	staticFS, err := web.StaticFS()
 	if err != nil {
 		fail("Failed to load embedded web assets", err, *openFlag)
 	}
@@ -239,7 +239,7 @@ func pollDHCP(ctx context.Context, eng *engine.Engine, src dhcp.Source, interval
 // runWindow opens a native desktop window pointing to the local server.
 func runWindow(targetURL string) {
 	// Set native macOS Dock icon via Cocoa runtime
-	if pngBytes, err := web.GetIconPNG(); err == nil && len(pngBytes) > 0 {
+	if pngBytes, err := web.IconPNG(); err == nil && len(pngBytes) > 0 {
 		setNativeDockIcon(pngBytes)
 	}
 

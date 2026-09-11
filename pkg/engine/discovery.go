@@ -46,10 +46,10 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 	passStart := time.Now()
 	defer e.discoveryGate.end(passStart)
 
-	e.emitEvent("scan_start", map[string]string{
-		"subnet":      netInfo.SubnetCIDR,
-		"ssid":        netInfo.SSID,
-		"network_key": NetworkKeyFromInfo(netInfo),
+	e.emitEvent("scan_start", ScanStartEvent{
+		Subnet:     netInfo.SubnetCIDR,
+		SSID:       netInfo.SSID,
+		NetworkKey: NetworkKeyFromInfo(netInfo),
 	})
 
 	e.mu.Lock()
@@ -63,11 +63,11 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 	}
 	e.persistDevices(migrated)
 	if netChanged {
-		e.emitEvent("network_changed", map[string]interface{}{
-			"network_key": NetworkKeyFromInfo(netInfo),
-			"ssid":        netInfo.SSID,
-			"subnet":      netInfo.SubnetCIDR,
-			"devices":     e.GetDevices(),
+		e.emitEvent("network_changed", NetworkChangedEvent{
+			NetworkKey: NetworkKeyFromInfo(netInfo),
+			SSID:       netInfo.SSID,
+			Subnet:     netInfo.SubnetCIDR,
+			Devices:    e.GetDevices(),
 		})
 	}
 	e.listenMDNS(netInfo.InterfaceName)
@@ -89,9 +89,9 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 
 	rawDevices, err := e.sweepSubnet(ctx, netInfo.SubnetCIDR, netInfo.InterfaceName, skipHits,
 		func(current, total int) {
-			e.emitEvent("scan_progress", map[string]int{
-				"scanned": current,
-				"total":   total,
+			e.emitEvent("scan_progress", ScanProgressEvent{
+				Scanned: current,
+				Total:   total,
 			})
 		})
 	if err != nil {
@@ -192,11 +192,11 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 	}
 
 	finalList := e.GetDevices()
-	e.emitEvent("scan_complete", map[string]interface{}{
-		"total_devices": len(finalList),
-		"devices":       finalList,
-		"network_key":   NetworkKeyFromInfo(netInfo),
-		"timestamp":     now.Format(time.RFC3339),
+	e.emitEvent("scan_complete", ScanCompleteEvent{
+		TotalDevices: len(finalList),
+		Devices:      finalList,
+		NetworkKey:   NetworkKeyFromInfo(netInfo),
+		Timestamp:    now.Format(time.RFC3339),
 	})
 
 	return DiscoveryResult{

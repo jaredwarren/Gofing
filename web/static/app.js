@@ -320,7 +320,7 @@ document.addEventListener('DOMContentLoaded', () => {
           updateMetrics();
           renderFilteredActivity();
         }
-        if (data.is_scanning) setScanningState(true);
+        if (data.tiers && data.tiers.discovery_running) setScanningState(true);
       })
       .catch(err => console.error('Failed to fetch initial devices:', err));
   }

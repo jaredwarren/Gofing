@@ -31,7 +31,7 @@ const ssdpMSearch = "M-SEARCH * HTTP/1.1\r\n" +
 
 // DiscoverSSDP multicasts an M-SEARCH and collects the responders.
 //
-// The per-device ProbeUPnP sends a *unicast* M-SEARCH to one address, which
+// The per-device probeUPnP sends a *unicast* M-SEARCH to one address, which
 // only works for a host that both listens on unicast 1900 and is known to be
 // there. A multicast search instead asks the whole segment at once and returns
 // each responder's own LOCATION, which is the authoritative descriptor URL
@@ -92,7 +92,7 @@ func DiscoverSSDP(ctx context.Context, ifaceIP string, wait time.Duration) (map[
 		if _, seen := found[ip]; seen {
 			continue
 		}
-		r, err := ParseSSDPResponse(buf[:n])
+		r, err := parseSSDPResponse(buf[:n])
 		if err != nil {
 			continue
 		}
@@ -102,8 +102,7 @@ func DiscoverSSDP(ctx context.Context, ifaceIP string, wait time.Duration) (map[
 	return found, nil
 }
 
-// ParseSSDPResponse reads the HTTP-style headers of an M-SEARCH reply.
-func ParseSSDPResponse(data []byte) (SSDPResponder, error) {
+func parseSSDPResponse(data []byte) (SSDPResponder, error) {
 	var r SSDPResponder
 	rd := bufio.NewReader(bytes.NewReader(data))
 	line, err := rd.ReadString('\n')

@@ -25,9 +25,9 @@ func TestParseUPnPXML(t *testing.T) {
   </device>
 </root>`
 
-	info, err := ParseUPnPXML([]byte(xmlData))
+	info, err := parseUPnPXML([]byte(xmlData))
 	if err != nil {
-		t.Fatalf("ParseUPnPXML error: %v", err)
+		t.Fatalf("parseUPnPXML error: %v", err)
 	}
 	if info.FriendlyName != "Sonos Era 100 - Living Room" {
 		t.Errorf("expected friendly name 'Sonos Era 100 - Living Room', got %q", info.FriendlyName)
@@ -94,9 +94,9 @@ func TestParseNetBIOSResponse(t *testing.T) {
 	macOffset := rec2 + 18
 	copy(resp[macOffset:macOffset+6], []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55})
 
-	info, err := ParseNetBIOSResponse(resp[:macOffset+6])
+	info, err := parseNetBIOSResponse(resp[:macOffset+6])
 	if err != nil {
-		t.Fatalf("ParseNetBIOSResponse error: %v", err)
+		t.Fatalf("parseNetBIOSResponse error: %v", err)
 	}
 
 	if info.ComputerName != "MY-PC" {
@@ -121,7 +121,7 @@ func TestInspectTLSCert(t *testing.T) {
 		},
 	}
 
-	info := InspectTLSCert(cert, 443)
+	info := inspectTLSCert(cert, 443)
 	if info == nil {
 		t.Fatalf("expected non-nil TLSInfo")
 	}

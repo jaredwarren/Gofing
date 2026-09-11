@@ -16,9 +16,9 @@ const ssdpSample = "HTTP/1.1 200 OK\r\n" +
 	"\r\n"
 
 func TestParseSSDPResponse(t *testing.T) {
-	got, err := ParseSSDPResponse([]byte(ssdpSample))
+	got, err := parseSSDPResponse([]byte(ssdpSample))
 	if err != nil {
-		t.Fatalf("ParseSSDPResponse: %v", err)
+		t.Fatalf("parseSSDPResponse: %v", err)
 	}
 	if got.Location != "http://192.168.0.1:1900/lohda/rootDesc.xml" {
 		t.Errorf("Location = %q", got.Location)
@@ -42,7 +42,7 @@ func TestParseSSDPResponseRejectsJunk(t *testing.T) {
 		"200 with nothing": "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\n\r\n",
 	}
 	for name, body := range cases {
-		if _, err := ParseSSDPResponse([]byte(body)); err == nil {
+		if _, err := parseSSDPResponse([]byte(body)); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
 	}

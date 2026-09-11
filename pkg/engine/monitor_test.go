@@ -106,8 +106,8 @@ func TestPresenceRunsDuringDiscovery(t *testing.T) {
 	if !called.Load() {
 		t.Fatal("presence must keep probing while a discovery sweep runs")
 	}
-	if !eng.IsScanning() {
-		t.Fatal("IsScanning should report the in-flight discovery sweep")
+	if !eng.discoveryGate.running() {
+		t.Fatal("discovery gate should still be held after presence runs")
 	}
 }
 

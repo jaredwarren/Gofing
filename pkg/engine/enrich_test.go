@@ -226,7 +226,7 @@ func TestEnrichOnceSkipsOfflineDevice(t *testing.T) {
 	eng.mu.Unlock()
 
 	resolveCalls := 0
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		resolveCalls++
 		return mdns.DeviceDetails{Hostname: "should-not-happen"}
 	}, func(mac string) string { return "Acme" })
@@ -257,7 +257,7 @@ func TestEnrichOnceProbesOfflineDeviceWhenManual(t *testing.T) {
 	eng.mu.Unlock()
 
 	resolveCalls := 0
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		resolveCalls++
 		return mdns.DeviceDetails{Hostname: "asked-for-it", NameSource: mdns.NameSourceDNS}
 	}, func(mac string) string { return "Acme" })
@@ -280,7 +280,7 @@ func TestEnrichOnceAppliesDetailsAndStamps(t *testing.T) {
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.52", MAC: "AA:BB:CC:DD:EE:52"},
 		mdns.DeviceDetails{}, "", time.Now(), nil)
 
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		return mdns.DeviceDetails{
 			Hostname:   "kitchen-hue",
 			NameSource: mdns.NameSourceDNS,
@@ -336,7 +336,7 @@ func TestEnrichOnceEmitsOnlyWhenMeaningful(t *testing.T) {
 	})
 
 	// Re-fingerprinting with identical results must not push an SSE frame.
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		return mdns.DeviceDetails{
 			Hostname: "stable", NameSource: mdns.NameSourceDNS,
 			DeviceType: "Computer", Services: []string{"SSH"},
@@ -353,7 +353,7 @@ func TestEnrichOnceEmitsOnlyWhenMeaningful(t *testing.T) {
 
 	// A real change must emit. The name has to arrive from a higher-ranked
 	// source, since PreferHostname deliberately keeps the incumbent on a tie.
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		return mdns.DeviceDetails{
 			Hostname: "renamed", NameSource: mdns.NameSourceARP,
 			DeviceType: "Computer", Services: []string{"SSH"},
@@ -375,7 +375,7 @@ func TestEnrichOnceKeepsIncumbentNameOnEqualRank(t *testing.T) {
 		mdns.DeviceDetails{Hostname: "first", NameSource: mdns.NameSourceDNS},
 		"Acme", time.Now(), nil)
 
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		return mdns.DeviceDetails{Hostname: "second", NameSource: mdns.NameSourceDNS}
 	}, func(mac string) string { return "Acme" })
 
@@ -410,7 +410,7 @@ func TestEnrichOnceSurvivesRemountDuringProbe(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		close(started)
 		select {
 		case <-release:
@@ -478,7 +478,7 @@ func TestEnrichOnceDoesNotWipeKnownFieldsOnEmptyProbe(t *testing.T) {
 
 	// A probe that timed out returns nothing. That is not evidence the device
 	// lost its name, type, services or vendor.
-	eng.SetEnrichTestHooks(
+	eng.setEnrichTestHooks(
 		func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 			return mdns.DeviceDetails{}
 		},
@@ -514,7 +514,7 @@ func TestEnrichOnceEmptyProbeIncrementsFailures(t *testing.T) {
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.61", MAC: "AA:BB:CC:DD:EE:61"},
 		mdns.DeviceDetails{}, "", time.Now(), nil)
 
-	eng.SetEnrichTestHooks(
+	eng.setEnrichTestHooks(
 		func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 			return mdns.DeviceDetails{}
 		},
@@ -536,7 +536,7 @@ func TestEnrichOnceEmptyProbeIncrementsFailures(t *testing.T) {
 	}
 
 	// A real learn resets the counter.
-	eng.SetEnrichTestHooks(
+	eng.setEnrichTestHooks(
 		func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 			return mdns.DeviceDetails{Hostname: "finally", NameSource: mdns.NameSourceDNS}
 		},
@@ -600,7 +600,7 @@ func TestEnrichWorkerDrainsQueue(t *testing.T) {
 		mdns.DeviceDetails{}, "Unknown Vendor", time.Now(), nil)
 
 	resolved := make(chan struct{}, 1)
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		select {
 		case resolved <- struct{}{}:
 		default:
@@ -627,11 +627,11 @@ func TestEnrichOnceAppliesProbeResult(t *testing.T) {
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.77", MAC: "AA:BB:CC:DD:EE:77"},
 		mdns.DeviceDetails{}, "Generic", time.Now(), nil)
 
-	eng.SetEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
+	eng.setEnrichTestHooks(func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 		return mdns.DeviceDetails{}
 	}, func(mac string) string { return "Generic" })
 
-	eng.SetProbeTestHook(func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult {
+	eng.setProbeTestHook(func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult {
 		return probes.ProbeResult{
 			IP: ip,
 			NetBIOS: &probes.NetBIOSInfo{
@@ -687,7 +687,7 @@ func TestEngineProbeDeviceOnDemand(t *testing.T) {
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.88", MAC: "AA:BB:CC:DD:EE:88"},
 		mdns.DeviceDetails{}, "Generic", time.Now(), nil)
 
-	eng.SetProbeTestHook(func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult {
+	eng.setProbeTestHook(func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult {
 		return probes.ProbeResult{
 			IP: ip,
 			NetBIOS: &probes.NetBIOSInfo{

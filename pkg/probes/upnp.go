@@ -12,7 +12,6 @@ import (
 	"time"
 )
 
-// rootXML is the top-level UPnP device descriptor schema.
 type rootXML struct {
 	XMLName xml.Name  `xml:"root"`
 	Device  deviceXML `xml:"device"`
@@ -28,8 +27,7 @@ type deviceXML struct {
 	PresentationURL string `xml:"presentationURL"`
 }
 
-// ParseUPnPXML parses a standard UPnP XML device description document.
-func ParseUPnPXML(data []byte) (*UPnPInfo, error) {
+func parseUPnPXML(data []byte) (*UPnPInfo, error) {
 	var r rootXML
 	if err := xml.Unmarshal(data, &r); err != nil {
 		return nil, err
@@ -46,9 +44,8 @@ func ParseUPnPXML(data []byte) (*UPnPInfo, error) {
 	return info, nil
 }
 
-// ProbeUPnP sends a unicast SSDP discovery packet to the target IP on port 1900
-// and fetches the device XML descriptor if a LOCATION header is returned.
-func ProbeUPnP(ctx context.Context, ip string) (*UPnPInfo, error) {
+// probeUPnP sends a unicast SSDP M-SEARCH and fetches the LOCATION descriptor.
+func probeUPnP(ctx context.Context, ip string) (*UPnPInfo, error) {
 	target := net.JoinHostPort(ip, "1900")
 	conn, err := net.DialTimeout("udp", target, 750*time.Millisecond)
 	if err != nil {
@@ -129,7 +126,7 @@ func ProbeUPnP(ctx context.Context, ip string) (*UPnPInfo, error) {
 		return nil, err
 	}
 
-	info, err := ParseUPnPXML(body)
+	info, err := parseUPnPXML(body)
 	if err != nil {
 		return nil, err
 	}

@@ -1,15 +1,18 @@
 package engine
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Settings holds user-configurable runtime preferences.
 type Settings struct {
-	ScanIntervalSec    int  `json:"scan_interval_sec"`    // Tier 2: full-subnet discovery sweep
-	MonitorIntervalSec int  `json:"monitor_interval_sec"` // Tier 1: presence probe of known devices
-	EnrichTTLSec       int  `json:"enrich_ttl_sec"`       // Tier 3: re-fingerprint an identified device
-	AlertsEnabled      bool `json:"alerts_enabled"`       // master switch for all alerts
-	AlertOnline        bool `json:"alert_online"`         // notify when a device comes back online
-	AlertOffline       bool `json:"alert_offline"`        // notify when a device goes offline
+	ScanIntervalSec     int  `json:"scan_interval_sec"`     // Tier 2: full-subnet discovery sweep
+	PresenceIntervalSec int  `json:"presence_interval_sec"` // Tier 1: presence probe of known devices
+	EnrichTTLSec        int  `json:"enrich_ttl_sec"`        // Tier 3: re-fingerprint an identified device
+	AlertsEnabled       bool `json:"alerts_enabled"`        // master switch for all alerts
+	AlertOnline         bool `json:"alert_online"`          // notify when a device comes back online
+	AlertOffline        bool `json:"alert_offline"`         // notify when a device goes offline
 	// AlertCooldownSec is the minimum gap between two alerts about the same
 	// device. A device whose reachability is genuinely marginal will still flip
 	// state; this bounds how often that is allowed to interrupt the user.
@@ -18,6 +21,23 @@ type Settings struct {
 	NotifymacOS      bool   `json:"notify_macos"`
 	RemoteOUILookup  bool   `json:"remote_oui_lookup"` // allow maclookup.app (OUI prefix only)
 	DataDir          string `json:"data_dir,omitempty"`
+}
+
+// UnmarshalJSON accepts legacy monitor_interval_sec as an alias for presence.
+func (s *Settings) UnmarshalJSON(data []byte) error {
+	type alias Settings
+	aux := struct {
+		alias
+		LegacyMonitor int `json:"monitor_interval_sec"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*s = Settings(aux.alias)
+	if s.PresenceIntervalSec == 0 && aux.LegacyMonitor > 0 {
+		s.PresenceIntervalSec = aux.LegacyMonitor
+	}
+	return nil
 }
 
 // Bounds for the user-supplied cadences. A value outside its range is clamped
@@ -64,7 +84,13 @@ func clampInterval(v, min, max, def int) int {
 }
 
 // presenceInterval is the Tier-1 presence cadence.
-func (e *Engine) presenceInterval() time.Duration { return e.monitorInterval() }
+func (e *Engine) presenceInterval() time.Duration {
+	e.settingsMu.RLock()
+	sec := e.settings.PresenceIntervalSec
+	e.settingsMu.RUnlock()
+	return time.Duration(clampInterval(sec, presenceIntervalMin, presenceIntervalMax,
+		DefaultSettings().PresenceIntervalSec)) * time.Second
+}
 
 // discoveryInterval is the Tier-2 full-sweep cadence.
 func (e *Engine) discoveryInterval() time.Duration {
@@ -94,15 +120,32 @@ func (e *Engine) enrichTTL() time.Duration {
 
 // SettingsPatch is a partial update for PUT /api/settings.
 type SettingsPatch struct {
-	ScanIntervalSec    *int  `json:"scan_interval_sec"`
-	MonitorIntervalSec *int  `json:"monitor_interval_sec"`
-	EnrichTTLSec       *int  `json:"enrich_ttl_sec"`
-	AlertsEnabled      *bool `json:"alerts_enabled"`
-	AlertOnline        *bool `json:"alert_online"`
-	AlertOffline       *bool `json:"alert_offline"`
-	AlertCooldownSec   *int  `json:"alert_cooldown_sec"`
-	NotifymacOS        *bool `json:"notify_macos"`
-	RemoteOUILookup    *bool `json:"remote_oui_lookup"`
+	ScanIntervalSec     *int  `json:"scan_interval_sec"`
+	PresenceIntervalSec *int  `json:"presence_interval_sec"`
+	EnrichTTLSec        *int  `json:"enrich_ttl_sec"`
+	AlertsEnabled       *bool `json:"alerts_enabled"`
+	AlertOnline         *bool `json:"alert_online"`
+	AlertOffline        *bool `json:"alert_offline"`
+	AlertCooldownSec    *int  `json:"alert_cooldown_sec"`
+	NotifymacOS         *bool `json:"notify_macos"`
+	RemoteOUILookup     *bool `json:"remote_oui_lookup"`
+}
+
+// UnmarshalJSON accepts legacy monitor_interval_sec as an alias for presence.
+func (p *SettingsPatch) UnmarshalJSON(data []byte) error {
+	type alias SettingsPatch
+	aux := struct {
+		alias
+		LegacyMonitor *int `json:"monitor_interval_sec"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*p = SettingsPatch(aux.alias)
+	if p.PresenceIntervalSec == nil && aux.LegacyMonitor != nil {
+		p.PresenceIntervalSec = aux.LegacyMonitor
+	}
+	return nil
 }
 
 // DefaultSettings returns built-in defaults: presence every 10s, a full
@@ -110,15 +153,15 @@ type SettingsPatch struct {
 // every 12 hours.
 func DefaultSettings() Settings {
 	return Settings{
-		ScanIntervalSec:    300,
-		MonitorIntervalSec: 10,
-		EnrichTTLSec:       43200,
-		AlertsEnabled:      true,
-		AlertOnline:        true,
-		AlertOffline:       true,
-		AlertCooldownSec:   300,
-		NotifymacOS:        true,
-		RemoteOUILookup:    true,
+		ScanIntervalSec:     300,
+		PresenceIntervalSec: 10,
+		EnrichTTLSec:        43200,
+		AlertsEnabled:       true,
+		AlertOnline:         true,
+		AlertOffline:        true,
+		AlertCooldownSec:    300,
+		NotifymacOS:         true,
+		RemoteOUILookup:     true,
 	}
 }
 

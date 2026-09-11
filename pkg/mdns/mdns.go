@@ -40,7 +40,7 @@ type Resolver struct {
 	listenIface  string
 }
 
-// New returns a new Resolver. Call Listen to join mDNS multicast.
+// New returns a Resolver. Call Listen to join mDNS multicast.
 func New() *Resolver {
 	return &Resolver{
 		mdnsCache: make(map[string]string),

@@ -10,8 +10,7 @@ import (
 	"time"
 )
 
-// InspectTLSCert extracts structured identity details from an x509 certificate.
-func InspectTLSCert(cert *x509.Certificate, port int) *TLSInfo {
+func inspectTLSCert(cert *x509.Certificate, port int) *TLSInfo {
 	if cert == nil {
 		return nil
 	}
@@ -26,9 +25,7 @@ func InspectTLSCert(cert *x509.Certificate, port int) *TLSInfo {
 	return info
 }
 
-// ProbeTLS attempts a TLS handshake against target IP on specified ports (defaulting to 443, 8443)
-// and extracts peer certificate subject details.
-func ProbeTLS(ctx context.Context, ip string, candidatePorts []int) (*TLSInfo, error) {
+func probeTLS(ctx context.Context, ip string, candidatePorts []int) (*TLSInfo, error) {
 	ports := candidatePorts
 	if len(ports) == 0 {
 		ports = []int{443, 8443}
@@ -55,7 +52,7 @@ func ProbeTLS(ctx context.Context, ip string, candidatePorts []int) (*TLSInfo, e
 		_ = conn.Close()
 
 		if len(state.PeerCertificates) > 0 {
-			info := InspectTLSCert(state.PeerCertificates[0], port)
+			info := inspectTLSCert(state.PeerCertificates[0], port)
 			if info != nil && (info.SubjectCN != "" || len(info.SANs) > 0) {
 				return info, nil
 			}

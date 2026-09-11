@@ -1,6 +1,5 @@
 package probes
 
-// UPnPInfo contains hardware and service details extracted from UPnP/SSDP device description XML.
 type UPnPInfo struct {
 	FriendlyName    string `json:"friendly_name,omitempty"`
 	Manufacturer    string `json:"manufacturer,omitempty"`
@@ -13,7 +12,6 @@ type UPnPInfo struct {
 	Location        string `json:"location,omitempty"`
 }
 
-// NetBIOSInfo contains Windows computer name and workgroup/domain information.
 type NetBIOSInfo struct {
 	ComputerName string `json:"computer_name,omitempty"`
 	Workgroup    string `json:"workgroup,omitempty"`
@@ -21,7 +19,6 @@ type NetBIOSInfo struct {
 	MAC          string `json:"mac,omitempty"`
 }
 
-// TLSInfo contains certificate identity details extracted from an HTTPS handshake.
 type TLSInfo struct {
 	Port      int      `json:"port"`
 	SubjectCN string   `json:"subject_cn,omitempty"`
@@ -29,8 +26,7 @@ type TLSInfo struct {
 	IssuerOrg string   `json:"issuer_org,omitempty"`
 }
 
-// RokuInfo contains identity reported by a Roku's ECP endpoint, including the
-// owner-assigned device name.
+// RokuInfo is identity from a Roku ECP endpoint, including the owner-assigned name.
 type RokuInfo struct {
 	Name         string `json:"name,omitempty"`
 	ModelName    string `json:"model_name,omitempty"`
@@ -40,7 +36,6 @@ type RokuInfo struct {
 	SoftwareVer  string `json:"software_version,omitempty"`
 }
 
-// ProbeResult aggregates findings from all protocol probes executed against a target host.
 type ProbeResult struct {
 	IP      string       `json:"ip"`
 	UPnP    *UPnPInfo    `json:"upnp,omitempty"`

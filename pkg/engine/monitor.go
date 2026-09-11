@@ -23,14 +23,6 @@ func (e *Engine) MonitorOnce(ctx context.Context) {
 	e.PresenceOnce(ctx, e.currentNetInfo(30*time.Second))
 }
 
-func (e *Engine) monitorInterval() time.Duration {
-	e.settingsMu.RLock()
-	sec := e.settings.MonitorIntervalSec
-	e.settingsMu.RUnlock()
-	return time.Duration(clampInterval(sec, presenceIntervalMin, presenceIntervalMax,
-		DefaultSettings().MonitorIntervalSec)) * time.Second
-}
-
 func (e *Engine) loadSettings() {
 	if e.persist == nil {
 		return
@@ -40,8 +32,8 @@ func (e *Engine) loadSettings() {
 		return
 	}
 	defaults := DefaultSettings()
-	if s.MonitorIntervalSec == 0 {
-		s.MonitorIntervalSec = defaults.MonitorIntervalSec
+	if s.PresenceIntervalSec == 0 {
+		s.PresenceIntervalSec = defaults.PresenceIntervalSec
 	}
 	if s.ScanIntervalSec == 0 {
 		s.ScanIntervalSec = defaults.ScanIntervalSec
@@ -87,9 +79,9 @@ func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
 		e.settings.ScanIntervalSec = clampInterval(*patch.ScanIntervalSec,
 			discoveryIntervalMin, discoveryIntervalMax, defaults.ScanIntervalSec)
 	}
-	if patch.MonitorIntervalSec != nil && *patch.MonitorIntervalSec > 0 {
-		e.settings.MonitorIntervalSec = clampInterval(*patch.MonitorIntervalSec,
-			presenceIntervalMin, presenceIntervalMax, defaults.MonitorIntervalSec)
+	if patch.PresenceIntervalSec != nil && *patch.PresenceIntervalSec > 0 {
+		e.settings.PresenceIntervalSec = clampInterval(*patch.PresenceIntervalSec,
+			presenceIntervalMin, presenceIntervalMax, defaults.PresenceIntervalSec)
 	}
 	if patch.EnrichTTLSec != nil && *patch.EnrichTTLSec > 0 {
 		e.settings.EnrichTTLSec = clampInterval(*patch.EnrichTTLSec,

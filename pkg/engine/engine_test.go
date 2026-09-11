@@ -377,7 +377,7 @@ func TestResolveDeviceNameMissing(t *testing.T) {
 
 func TestResolveDeviceNameKeepsExistingWhenMiss(t *testing.T) {
 	eng := New(nil)
-	eng.SetTestHooks(
+	eng.setTestHooks(
 		func(context.Context, string) {},
 		func(context.Context, *mdns.Resolver, string) mdns.LookupResult { return mdns.LookupResult{} },
 	)

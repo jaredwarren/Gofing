@@ -232,8 +232,8 @@ func (s *Store) GetSettings() (Settings, error) {
 	if loaded.ScanIntervalSec == 0 {
 		loaded.ScanIntervalSec = defaults.ScanIntervalSec
 	}
-	if loaded.MonitorIntervalSec == 0 {
-		loaded.MonitorIntervalSec = defaults.MonitorIntervalSec
+	if loaded.PresenceIntervalSec == 0 {
+		loaded.PresenceIntervalSec = defaults.PresenceIntervalSec
 	}
 	if loaded.DataDir == "" {
 		loaded.DataDir = defaults.DataDir

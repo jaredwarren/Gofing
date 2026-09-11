@@ -95,9 +95,8 @@ func TestDevicesRootReportsTierStatus(t *testing.T) {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	body := rec.Body.String()
-	// The web UI reads only .devices and .is_scanning, so the added key must be
-	// present without disturbing those.
-	for _, want := range []string{`"devices"`, `"is_scanning"`, `"tiers"`,
+	// UI reads .devices and .tiers (including discovery_running for scan state).
+	for _, want := range []string{`"devices"`, `"tiers"`, `"discovery_running"`,
 		`"enrich_pending"`, `"discovery_interval_sec"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("response missing %s: %s", want, body)

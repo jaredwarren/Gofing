@@ -203,11 +203,11 @@ func (e *Engine) currentNetInfo(maxAge time.Duration) *network.Info {
 		}
 		e.persistDevices(migrated)
 		if prevKey != "" {
-			e.emitEvent("network_changed", map[string]interface{}{
-				"network_key": NetworkKeyFromInfo(info),
-				"ssid":        info.SSID,
-				"subnet":      info.SubnetCIDR,
-				"devices":     e.GetDevices(),
+			e.emitEvent("network_changed", NetworkChangedEvent{
+				NetworkKey: NetworkKeyFromInfo(info),
+				SSID:       info.SSID,
+				Subnet:     info.SubnetCIDR,
+				Devices:    e.GetDevices(),
 			})
 		}
 	}

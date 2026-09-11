@@ -60,13 +60,13 @@ type DevicePatch struct {
 }
 
 // EventFunc is called when a device is discovered or updated.
-type EventFunc func(eventType string, data interface{})
+type EventFunc func(eventType string, data any)
 
 // offlineMissThreshold is how many consecutive scans must miss a device
 // before it is marked offline. Absorbs flaky Wi‑Fi / probe timeouts.
 const offlineMissThreshold = 3
 
-// Engine coordinates scanning, fingerprinting, and state management.
+// Engine owns scanning, fingerprinting, and device state.
 type Engine struct {
 	// mu guards the device map and everything derived from it. Never hold it
 	// across I/O; never emit or persist while holding it.
@@ -129,7 +129,7 @@ type Engine struct {
 	deepProbeFn func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult
 }
 
-// New returns an initialized Engine. persist may be nil (in-memory only).
+// New returns an Engine. persist may be nil (in-memory only).
 func New(persist Persistence) *Engine {
 	e := &Engine{
 		devices:          make(map[string]*Device),
@@ -307,7 +307,7 @@ func (e *Engine) RegisterEventListener(fn EventFunc) {
 	e.listeners = append(e.listeners, fn)
 }
 
-func (e *Engine) emitEvent(eventType string, data interface{}) {
+func (e *Engine) emitEvent(eventType string, data any) {
 	e.listenersMu.RLock()
 	listeners := make([]EventFunc, len(e.listeners))
 	copy(listeners, e.listeners)
@@ -741,9 +741,9 @@ func (e *Engine) UpsertForTest(raw scanner.RawDevice, details mdns.DeviceDetails
 	return e.upsertDevice(raw, details, vendor, now, nil)
 }
 
-// SetEnrichTestHooks overrides the Tier-3 network probes so enrichment can be
+// setEnrichTestHooks overrides the Tier-3 network probes so enrichment can be
 // exercised without touching the network. Either may be nil to keep the real one.
-func (e *Engine) SetEnrichTestHooks(
+func (e *Engine) setEnrichTestHooks(
 	resolve func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails,
 	vendor func(mac string) string,
 ) {
@@ -753,8 +753,8 @@ func (e *Engine) SetEnrichTestHooks(
 	e.vendorFn = vendor
 }
 
-// SetProbeTestHook overrides deep device fingerprinting probes for unit testing.
-func (e *Engine) SetProbeTestHook(probe func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult) {
+// setProbeTestHook overrides deep device fingerprinting probes for unit testing.
+func (e *Engine) setProbeTestHook(probe func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.deepProbeFn = probe
@@ -774,8 +774,8 @@ func (e *Engine) probeDevice(ctx context.Context, ip string, knownPorts []int) p
 	return probes.ProbeDevice(ctx, ip, knownPorts)
 }
 
-// SetTestHooks configures custom network lookup functions for unit testing.
-func (e *Engine) SetTestHooks(warmHost func(ctx context.Context, ip string), deepLookup func(ctx context.Context, r *mdns.Resolver, ip string) mdns.LookupResult) {
+// setTestHooks configures custom network lookup functions for unit testing.
+func (e *Engine) setTestHooks(warmHost func(ctx context.Context, ip string), deepLookup func(ctx context.Context, r *mdns.Resolver, ip string) mdns.LookupResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.warmHostFn = warmHost
@@ -792,127 +792,6 @@ func warmHost(ctx context.Context, ip string) {
 	_ = cmd.Run()
 }
 
-// ErrPortScanInProgress is returned when a port scan for the device is already running.
-var ErrPortScanInProgress = fmt.Errorf("port scan already in progress")
-
-func (e *Engine) tryBeginPortScan(id string) bool {
-	e.portScanMu.Lock()
-	defer e.portScanMu.Unlock()
-	if e.portScanInflight[id] {
-		return false
-	}
-	e.portScanInflight[id] = true
-	return true
-}
-
-func (e *Engine) endPortScan(id string) {
-	e.portScanMu.Lock()
-	defer e.portScanMu.Unlock()
-	delete(e.portScanInflight, id)
-}
-
-const (
-	portScanCommonBudget = 30 * time.Second
-	portScanDeepBudget   = 60 * time.Second
-)
-
-// TryStartPortScan validates and launches an async port scan. started=false means
-// one is already in flight for this device (not an error).
-//
-// The caller's context is intentionally unused: the scan runs on a detached
-// timeout so an HTTP handler returning after scan_started cannot cancel it.
-func (e *Engine) TryStartPortScan(_ context.Context, id, mode string) (started bool, err error) {
-	if _, ok := e.GetDevice(id); !ok {
-		return false, fmt.Errorf("device not found")
-	}
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		mode = "common"
-	}
-	if mode != "common" && mode != "deep" {
-		return false, fmt.Errorf("invalid mode %q (use common or deep)", mode)
-	}
-	if !e.tryBeginPortScan(id) {
-		return false, nil
-	}
-	budget := portScanCommonBudget
-	if mode == "deep" {
-		budget = portScanDeepBudget
-	}
-	scanCtx, cancel := context.WithTimeout(context.Background(), budget)
-	go func() {
-		defer cancel()
-		defer e.endPortScan(id)
-		if _, err := e.runPortScan(scanCtx, id, mode); err != nil {
-			slog.Error("port scan failed", "id", id, "mode", mode, "error", err)
-			e.emitEvent("portscan_error", map[string]interface{}{
-				"id":    id,
-				"mode":  mode,
-				"error": err.Error(),
-			})
-		}
-	}()
-	return true, nil
-}
-
-// ScanDevicePorts probes a device for open ports and persists the result.
-// mode is "common" (default) or "deep" (ports 1–1024, capped).
-func (e *Engine) ScanDevicePorts(ctx context.Context, id, mode string) ([]ports.ServicePort, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		mode = "common"
-	}
-	if mode != "common" && mode != "deep" {
-		return nil, fmt.Errorf("invalid mode %q (use common or deep)", mode)
-	}
-	if !e.tryBeginPortScan(id) {
-		return nil, ErrPortScanInProgress
-	}
-	defer e.endPortScan(id)
-	return e.runPortScan(ctx, id, mode)
-}
-
-func (e *Engine) runPortScan(ctx context.Context, id, mode string) ([]ports.ServicePort, error) {
-	dev, ok := e.GetDevice(id)
-	if !ok {
-		return nil, fmt.Errorf("device not found")
-	}
-	if dev.IP == "" {
-		return nil, fmt.Errorf("device has no IP")
-	}
-
-	var open []ports.ServicePort
-	switch mode {
-	case "deep":
-		open = ports.ScanPortsRange(ctx, dev.IP, ports.DefaultDeepStart, ports.DefaultDeepEnd, 128, 80*time.Millisecond)
-	default:
-		open = ports.ScanPorts(ctx, dev.IP)
-	}
-
-	e.mu.Lock()
-	d, ok := e.devices[id]
-	if !ok {
-		e.mu.Unlock()
-		return nil, fmt.Errorf("device not found")
-	}
-	d.OpenPorts = open
-	out := *d
-	e.mu.Unlock()
-
-	e.persistDevice(out)
-	e.recordEvent("portscan", out.ID, fmt.Sprintf("Port scan (%s): %d open", mode, len(open)))
-	e.emitEvent("device_updated", &out)
-	e.emitEvent("portscan_complete", map[string]interface{}{
-		"id":         out.ID,
-		"mode":       mode,
-		"open_ports": open,
-	})
-	return open, nil
-}
-
 // ListDeviceHistory returns newest-first presence events for a device.
 func (e *Engine) ListDeviceHistory(id string, limit int) ([]Event, error) {
 	if _, ok := e.GetDevice(id); !ok {
@@ -925,12 +804,6 @@ func (e *Engine) ListDeviceHistory(id string, limit int) ([]Event, error) {
 		limit = 50
 	}
 	return e.persist.ListEvents(id, limit)
-}
-
-// IsScanning reports whether a discovery sweep is in flight. Presence and
-// enrichment run continuously and are reported separately via TierStatus.
-func (e *Engine) IsScanning() bool {
-	return e.discoveryGate.running()
 }
 
 // upsertOpts controls the side effects of a single upsert. Making these
@@ -1119,198 +992,6 @@ func (e *Engine) setOnlineLocked(d *Device, online bool) {
 		return
 	}
 	d.IsOnline = online
-}
-
-// applyDetailsLocked merges resolved fingerprint details into d using the ranked
-// name rules. Caller must hold e.mu, and must emit and persist only after
-// unlocking. An empty vendor leaves d.Vendor alone. Returns true if any
-// user-visible field changed.
-//
-// Both the discovery sweep and the enrichment tier merge through here, so the
-// precedence rules exist in exactly one place.
-func applyDetailsLocked(d *Device, details mdns.DeviceDetails, vendor string) bool {
-	before := *d
-
-	if details.Hostname != "" || details.NameSource != "" {
-		d.Hostname, d.NameSource = mdns.PreferHostname(
-			d.Hostname, d.NameSource,
-			details.Hostname, details.NameSource,
-		)
-	}
-	// Model/type are fingerprint hints only — never written into Hostname.
-	if details.DeviceType != "" {
-		d.DeviceType = details.DeviceType
-		d.Icon = details.Icon
-		d.Model = details.Model
-	}
-	// A probe that timed out returns no services; that is not evidence the
-	// device stopped offering the ones we already know about.
-	if len(details.Services) > 0 {
-		d.Services = details.Services
-	}
-	// Likewise, a local-only vendor miss must not erase a known vendor.
-	if vendor != "" {
-		d.Vendor = vendor
-	}
-
-	return before.Hostname != d.Hostname ||
-		before.NameSource != d.NameSource ||
-		before.DeviceType != d.DeviceType ||
-		before.Icon != d.Icon ||
-		before.Model != d.Model ||
-		before.Vendor != d.Vendor ||
-		!sameStrings(before.Services, d.Services)
-}
-
-// sameStrings reports whether two string slices hold the same values in order.
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// applyProbeResultLocked integrates findings from deep protocol probes into d.
-// Returns true if any user-visible field changed. Caller must hold e.mu.
-func applyProbeResultLocked(d *Device, res probes.ProbeResult) bool {
-	before := *d
-
-	// 1. UPnP / SSDP
-	if res.UPnP != nil {
-		if res.UPnP.ModelName != "" && (d.Model == "" || isGenericHostname(d.Model)) {
-			d.Model = res.UPnP.ModelName
-			if res.UPnP.ModelNumber != "" && !strings.Contains(d.Model, res.UPnP.ModelNumber) {
-				d.Model = fmt.Sprintf("%s (%s)", d.Model, res.UPnP.ModelNumber)
-			}
-		}
-		if res.UPnP.Manufacturer != "" && (!vendorKnown(d.Vendor) || strings.EqualFold(d.Vendor, "generic") || strings.EqualFold(d.Vendor, "unknown")) {
-			d.Vendor = res.UPnP.Manufacturer
-		}
-		if res.UPnP.FriendlyName != "" {
-			d.Hostname, d.NameSource = mdns.PreferHostname(
-				d.Hostname, d.NameSource,
-				res.UPnP.FriendlyName, mdns.NameSourceUPnP,
-			)
-		}
-		d.Services = addServiceTag(d.Services, "UPnP")
-	}
-
-	// 2. NetBIOS
-	if res.NetBIOS != nil {
-		if res.NetBIOS.ComputerName != "" {
-			d.Hostname, d.NameSource = mdns.PreferHostname(
-				d.Hostname, d.NameSource,
-				res.NetBIOS.ComputerName, mdns.NameSourceNetBIOS,
-			)
-		}
-		d.Services = addServiceTag(d.Services, "NetBIOS")
-		if res.NetBIOS.Workgroup != "" {
-			d.Services = addServiceTag(d.Services, "Workgroup: "+res.NetBIOS.Workgroup)
-		}
-	}
-
-	// 3. Roku ECP — the owner-assigned name ("Living room 2"), plus an exact
-	// model. Checked before TLS because it is a far stronger identity signal.
-	if res.Roku != nil {
-		if res.Roku.Name != "" {
-			d.Hostname, d.NameSource = mdns.PreferHostname(
-				d.Hostname, d.NameSource,
-				res.Roku.Name, mdns.NameSourceECP,
-			)
-		}
-		if res.Roku.ModelName != "" && (d.Model == "" || isGenericHostname(d.Model)) {
-			d.Model = res.Roku.ModelName
-			if res.Roku.ModelNumber != "" && !strings.Contains(d.Model, res.Roku.ModelNumber) {
-				d.Model = fmt.Sprintf("%s (%s)", d.Model, res.Roku.ModelNumber)
-			}
-		}
-		if res.Roku.VendorName != "" && !vendorKnown(d.Vendor) {
-			d.Vendor = res.Roku.VendorName
-		}
-		if d.DeviceType == "" || d.DeviceType == "Generic Device" {
-			d.DeviceType = "Media Player"
-			d.Icon = "tv"
-		}
-		d.Services = addServiceTag(d.Services, "Roku ECP")
-	}
-
-	// 4. TLS Certificate
-	if res.TLS != nil {
-		if res.TLS.SubjectCN != "" {
-			d.Hostname, d.NameSource = mdns.PreferHostname(
-				d.Hostname, d.NameSource,
-				res.TLS.SubjectCN, mdns.NameSourceTLS,
-			)
-		}
-		d.Services = addServiceTag(d.Services, "TLS Cert")
-	}
-
-	return before.Hostname != d.Hostname ||
-		before.NameSource != d.NameSource ||
-		before.Model != d.Model ||
-		before.Vendor != d.Vendor ||
-		!sameStrings(before.Services, d.Services)
-}
-
-func addServiceTag(services []string, tag string) []string {
-	tag = strings.TrimSpace(tag)
-	if tag == "" {
-		return services
-	}
-	for _, s := range services {
-		if strings.EqualFold(s, tag) {
-			return services
-		}
-	}
-	return append(services, tag)
-}
-
-// ProbeDevice executes multi-protocol fingerprinting against a device on demand,
-// merges findings, persists, emits device_updated, and returns the probe results.
-func (e *Engine) ProbeDevice(ctx context.Context, id string) (probes.ProbeResult, Device, error) {
-	dev, ok := e.GetDevice(id)
-	if !ok {
-		return probes.ProbeResult{}, Device{}, fmt.Errorf("device not found")
-	}
-	if dev.IP == "" {
-		return probes.ProbeResult{}, dev, fmt.Errorf("device has no IP address")
-	}
-
-	var openPorts []int
-	for _, sp := range dev.OpenPorts {
-		openPorts = append(openPorts, sp.Port)
-	}
-
-	res := e.probeDevice(ctx, dev.IP, openPorts)
-
-	e.mu.Lock()
-	d, ok := e.devices[dev.ID]
-	if !ok {
-		base := stripNetworkScope(dev.ID)
-		if e.activeNetworkKey != "" {
-			d, ok = e.devices[e.activeNetworkKey+"/"+base]
-		}
-	}
-	if !ok {
-		e.mu.Unlock()
-		return res, dev, fmt.Errorf("device disappeared during probe")
-	}
-
-	changed := applyProbeResultLocked(d, res)
-	out := *d
-	e.mu.Unlock()
-
-	if changed {
-		e.persistDevice(out)
-		e.emitEvent("device_updated", &out)
-	}
-
-	return res, out, nil
 }
 
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.

@@ -26,7 +26,7 @@ type macLookupResponse struct {
 	IsPrivate bool   `json:"isPrivate"`
 }
 
-// DB encapsulates the IEEE OUI prefix map and persistent vendor cache.
+// DB holds the IEEE OUI prefix map and persistent vendor cache.
 type DB struct {
 	ouiMap     map[string]string
 	diskCache  map[string]string

@@ -47,7 +47,7 @@ func discoveryEngine(t *testing.T, reachable ...string) (*Engine, *memPersist, *
 		}
 		return out, nil
 	}
-	eng.SetEnrichTestHooks(
+	eng.setEnrichTestHooks(
 		func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails {
 			return mdns.DeviceDetails{}
 		},
@@ -249,7 +249,7 @@ func TestStartTiersExitsOnContextCancel(t *testing.T) {
 	sec := 300
 	fast := 300
 	if _, err := eng.UpdateSettings(SettingsPatch{
-		ScanIntervalSec: &sec, MonitorIntervalSec: &fast,
+		ScanIntervalSec: &sec, PresenceIntervalSec: &fast,
 	}); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
 	}

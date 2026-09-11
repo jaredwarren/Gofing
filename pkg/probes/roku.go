@@ -27,8 +27,7 @@ type rokuDeviceInfoXML struct {
 	DeviceID       string   `xml:"device-id"`
 }
 
-// ParseRokuDeviceInfo parses a Roku ECP /query/device-info document.
-func ParseRokuDeviceInfo(data []byte) (*RokuInfo, error) {
+func parseRokuDeviceInfo(data []byte) (*RokuInfo, error) {
 	var d rokuDeviceInfoXML
 	if err := xml.Unmarshal(data, &d); err != nil {
 		return nil, err
@@ -58,12 +57,12 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// ProbeRoku fetches identity from a Roku's ECP endpoint.
+// probeRoku fetches identity from a Roku's ECP endpoint.
 //
 // Worth a dedicated probe because a Roku answers neither ICMP reliably nor any
 // of the other identity protocols, yet hands over its owner-assigned name,
 // exact model and serial for one unauthenticated GET.
-func ProbeRoku(ctx context.Context, ip string) (*RokuInfo, error) {
+func probeRoku(ctx context.Context, ip string) (*RokuInfo, error) {
 	if ip == "" {
 		return nil, fmt.Errorf("probes: no ip")
 	}
@@ -88,5 +87,5 @@ func ProbeRoku(ctx context.Context, ip string) (*RokuInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ParseRokuDeviceInfo(body)
+	return parseRokuDeviceInfo(body)
 }

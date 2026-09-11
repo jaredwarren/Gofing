@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -253,7 +254,7 @@ func TestLoadFromStoreSeedsLastEnriched(t *testing.T) {
 func TestLoadSettingsMigratesLegacyScanInterval(t *testing.T) {
 	p := newMemPersist()
 	// The pre-tier default that databases in the wild actually hold.
-	_ = p.SetSettings(Settings{ScanIntervalSec: 30, MonitorIntervalSec: 10})
+	_ = p.SetSettings(Settings{ScanIntervalSec: 30, PresenceIntervalSec: 10})
 
 	eng := New(p)
 	if got := eng.GetSettings().ScanIntervalSec; got != DefaultSettings().ScanIntervalSec {
@@ -271,9 +272,9 @@ func TestLoadSettingsMigratesLegacyScanInterval(t *testing.T) {
 func TestSettingsAccessorsClamp(t *testing.T) {
 	eng := New(nil)
 	if _, err := eng.UpdateSettings(SettingsPatch{
-		ScanIntervalSec:    ptr(5),      // below the 60s floor
-		MonitorIntervalSec: ptr(100000), // above the 300s ceiling
-		EnrichTTLSec:       ptr(1),      // below the 60s floor
+		ScanIntervalSec:     ptr(5),      // below the 60s floor
+		PresenceIntervalSec: ptr(100000), // above the 300s ceiling
+		EnrichTTLSec:        ptr(1),      // below the 60s floor
 	}); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
 	}
@@ -289,3 +290,21 @@ func TestSettingsAccessorsClamp(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestSettingsLegacyMonitorIntervalJSON(t *testing.T) {
+	var s Settings
+	if err := json.Unmarshal([]byte(`{"monitor_interval_sec":15,"scan_interval_sec":300}`), &s); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if s.PresenceIntervalSec != 15 {
+		t.Fatalf("PresenceIntervalSec = %d, want 15 from legacy key", s.PresenceIntervalSec)
+	}
+
+	var patch SettingsPatch
+	if err := json.Unmarshal([]byte(`{"monitor_interval_sec":20}`), &patch); err != nil {
+		t.Fatalf("patch Unmarshal: %v", err)
+	}
+	if patch.PresenceIntervalSec == nil || *patch.PresenceIntervalSec != 20 {
+		t.Fatalf("patch PresenceIntervalSec = %v, want 20", patch.PresenceIntervalSec)
+	}
+}

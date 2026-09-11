@@ -20,23 +20,21 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/version"
 )
 
-// Server encapsulates the HTTP API, SSE streaming, and embedded frontend delivery.
 type Server struct {
 	devEngine  *engine.Engine
 	staticFS   fs.FS
-	sseClients map[chan string]bool
+	sseClients map[chan string]struct{}
 	sseMu      sync.RWMutex
 }
 
-// New returns a new Server instance.
 func New(devEngine *engine.Engine, staticFS fs.FS) *Server {
 	srv := &Server{
 		devEngine:  devEngine,
 		staticFS:   staticFS,
-		sseClients: make(map[chan string]bool),
+		sseClients: make(map[chan string]struct{}),
 	}
 
-	devEngine.RegisterEventListener(func(eventType string, data interface{}) {
+	devEngine.RegisterEventListener(func(eventType string, data any) {
 		srv.broadcastSSE(eventType, data)
 	})
 
@@ -87,10 +85,9 @@ func (s *Server) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	devices := s.devEngine.GetDevices()
-	writeJSON(w, map[string]interface{}{
-		"devices":     devices,
-		"is_scanning": s.devEngine.IsScanning(),
-		"tiers":       s.devEngine.TierStatus(),
+	writeJSON(w, map[string]any{
+		"devices": devices,
+		"tiers":   s.devEngine.TierStatus(),
 	})
 }
 
@@ -221,7 +218,7 @@ func (s *Server) handleProbeDevice(w http.ResponseWriter, r *http.Request, id st
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	writeJSON(w, map[string]interface{}{
+	writeJSON(w, map[string]any{
 		"status": "success",
 		"probe":  probeRes,
 		"device": dev,
@@ -293,7 +290,7 @@ func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request, id 
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	writeJSON(w, map[string]interface{}{
+	writeJSON(w, map[string]any{
 		"events": events,
 	})
 }
@@ -311,7 +308,7 @@ func (s *Server) handleDeviceRDNS(w http.ResponseWriter, r *http.Request, id str
 	if len(names) == 0 && res.Hostname != "" {
 		names = append(names, res.Hostname)
 	}
-	writeJSON(w, map[string]interface{}{
+	writeJSON(w, map[string]any{
 		"names":       names,
 		"hostname":    res.Hostname,
 		"name_source": res.NameSource,
@@ -398,7 +395,7 @@ func (s *Server) handleDHCPImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res := s.devEngine.ImportDHCPLeases(leases)
-	writeJSON(w, map[string]interface{}{
+	writeJSON(w, map[string]any{
 		"status":  "ok",
 		"created": res.Created,
 		"updated": res.Updated,
@@ -444,7 +441,7 @@ func (s *Server) handleEventsHistory(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]interface{}{"events": events})
+	writeJSON(w, map[string]any{"events": events})
 }
 
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -457,7 +454,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	clientChan := make(chan string, 50)
 
 	s.sseMu.Lock()
-	s.sseClients[clientChan] = true
+	s.sseClients[clientChan] = struct{}{}
 	s.sseMu.Unlock()
 
 	defer func() {
@@ -466,9 +463,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.sseMu.Unlock()
 	}()
 
-	initialBytes, _ := json.Marshal(map[string]interface{}{
-		"devices":     s.devEngine.GetDevices(),
-		"is_scanning": s.devEngine.IsScanning(),
+	initialBytes, _ := json.Marshal(map[string]any{
+		"devices": s.devEngine.GetDevices(),
+		"tiers":   s.devEngine.TierStatus(),
 	})
 	fmt.Fprintf(w, "event: init\ndata: %s\n\n", string(initialBytes))
 	w.(http.Flusher).Flush()
@@ -485,7 +482,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) broadcastSSE(eventType string, data interface{}) {
+func (s *Server) broadcastSSE(eventType string, data any) {
 	payload, err := json.Marshal(data)
 	if err != nil {
 		slog.Error("SSE marshal error", "error", err)
@@ -505,7 +502,7 @@ func (s *Server) broadcastSSE(eventType string, data interface{}) {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, v interface{}) {
+func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }

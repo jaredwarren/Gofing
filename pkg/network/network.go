@@ -24,7 +24,7 @@ type Info struct {
 func GetActiveNetworkInfo() (*Info, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get interfaces: %w", err)
+		return nil, fmt.Errorf("list interfaces: %w", err)
 	}
 
 	gatewayIP := getmacOSGatewayIP()

@@ -48,7 +48,6 @@ type arpCache struct {
 	at   time.Time
 }
 
-// New returns a new Scanner instance.
 func New() *Scanner {
 	return &Scanner{}
 }
@@ -67,7 +66,7 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, ski
 	}
 	ips, err := expandCIDR(subnetCIDR)
 	if err != nil {
-		return nil, fmt.Errorf("failed to expand CIDR: %w", err)
+		return nil, fmt.Errorf("expand CIDR: %w", err)
 	}
 
 	toProbe := filterSkippedIPs(ips, skipHits)
@@ -80,7 +79,7 @@ func (s *Scanner) PerformScan(ctx context.Context, subnetCIDR, iface string, ski
 	// the enrichment tier resolves names properly anyway.
 	arpDevices, err := s.ARPTableNumeric(ctx, 0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse ARP table: %w", err)
+		return nil, fmt.Errorf("parse ARP table: %w", err)
 	}
 	for _, dev := range arpDevices {
 		arpByIP[dev.IP] = dev

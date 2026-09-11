@@ -16,9 +16,9 @@ const rokuSample = `<device-info>
 </device-info>`
 
 func TestParseRokuDeviceInfo(t *testing.T) {
-	got, err := ParseRokuDeviceInfo([]byte(rokuSample))
+	got, err := parseRokuDeviceInfo([]byte(rokuSample))
 	if err != nil {
-		t.Fatalf("ParseRokuDeviceInfo: %v", err)
+		t.Fatalf("parseRokuDeviceInfo: %v", err)
 	}
 	// The owner-assigned name is the point; the friendly name is just the model.
 	if got.Name != "Living room 2" {
@@ -39,10 +39,10 @@ func TestParseRokuDeviceInfo(t *testing.T) {
 }
 
 func TestParseRokuFallsBackToFriendlyName(t *testing.T) {
-	got, err := ParseRokuDeviceInfo([]byte(
+	got, err := parseRokuDeviceInfo([]byte(
 		`<device-info><vendor-name>Roku</vendor-name><friendly-device-name>Bedroom TV</friendly-device-name></device-info>`))
 	if err != nil {
-		t.Fatalf("ParseRokuDeviceInfo: %v", err)
+		t.Fatalf("parseRokuDeviceInfo: %v", err)
 	}
 	if got.Name != "Bedroom TV" {
 		t.Errorf("Name = %q, want the friendly name when no user name is set", got.Name)
@@ -56,7 +56,7 @@ func TestParseRokuRejectsNonRoku(t *testing.T) {
 		`<device-info></device-info>`, // well-formed but empty
 		`<root><device><friendlyName>x</friendlyName></device></root>`, // a UPnP doc
 	} {
-		if _, err := ParseRokuDeviceInfo([]byte(bad)); err == nil {
+		if _, err := parseRokuDeviceInfo([]byte(bad)); err == nil {
 			t.Errorf("should have rejected %q", bad)
 		}
 	}

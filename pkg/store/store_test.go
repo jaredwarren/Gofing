@@ -120,7 +120,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 
 	want := Settings{
 		ScanIntervalSec:    60,
-		MonitorIntervalSec: 5,
+		PresenceIntervalSec: 5,
 		AlertsEnabled:      false,
 		NotifymacOS:        true,
 		DataDir:            "/tmp/gofing-test",
