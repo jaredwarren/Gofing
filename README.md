@@ -33,7 +33,7 @@ go test ./...
 CGO_ENABLED=1 go build -o gofing .
 ./gofing -port 8080
 ./gofing -port 8080 -open=false   # headless (API only)
-./gofing -port 8080 -browser=brave
+./gofing -listen 0.0.0.0 -port 8080 -open=false  # LAN bind (no auth — prefer loopback)
 ```
 
 Flags:
@@ -41,9 +41,9 @@ Flags:
 | Flag | Default | Description |
 |---|---|---|
 | `-port` | `8080` | Web UI / API port |
-| `-interval` | `30s` | Background subnet rescan interval |
-| `-open` | `true` | Open a [go-webui](https://github.com/webui-dev/go-webui) desktop window (Brave/Chrome app profile); use `-open=false` for headless |
-| `-browser` | `auto` | Preferred GUI browser: `brave`, `chrome`, `webview`, or empty for auto |
+| `-listen` | `127.0.0.1` | Bind address (loopback by default; `0.0.0.0` exposes the API on the LAN with **no auth**) |
+| `-interval` | `5m` | Seeds the Tier-2 discovery sweep interval (prefer PATCH `/api/settings`) |
+| `-open` | `true` | Open a native macOS desktop window; use `-open=false` for headless |
 | `-data-dir` | Application Support | Directory for `gofing.db` / caches |
 | `-dhcp-file` | `<data-dir>/dhcp-clients.txt` | Poll this DHCP client-list export (created if you save one there) |
 | `-dhcp-url` | empty | HTTP GET of JSON or client-list text to poll |
@@ -62,6 +62,8 @@ Persistent data lives under:
 | `gofing.db` | BoltDB device inventory, events, settings (`pkg/store`) |
 | `oui_cache.json` | OUI vendor lookup cache (`pkg/oui`) |
 | `dhcp-clients.txt` | Optional DHCP client-list export, polled automatically |
+
+With `remote_oui_lookup` enabled (default), enrichment may query `api.maclookup.app` using the **6-hex OUI prefix only** — never a full MAC. Disable with `PUT /api/settings` `{ "remote_oui_lookup": false }`.
 
 ## Roadmap
 

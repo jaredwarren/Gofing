@@ -3,6 +3,7 @@ gofing
 Gofing.app/
 build/*.app/
 build/gofing-notify
+build/.last_build_hash
 
 # Local DHCP export (home MACs / IPs / hostnames)
 sample.log

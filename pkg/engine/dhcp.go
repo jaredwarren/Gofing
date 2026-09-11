@@ -19,6 +19,10 @@ type DHCPImportResult struct {
 // ImportDHCPLeases upserts router DHCP client-list rows by MAC.
 // Names use NameSourceDHCP. Leases never mark a device online — presence stays
 // with ARP/scan. Sleeping devices therefore appear named but offline.
+//
+// Vendor resolution uses the local OUI table only — never HTTP — so this path
+// cannot hold e.mu across a network round-trip. Unknown vendors are left empty
+// for Tier 3 to fill later.
 func (e *Engine) ImportDHCPLeases(leases []dhcp.Lease) DHCPImportResult {
 	var res DHCPImportResult
 	if len(leases) == 0 {
@@ -48,12 +52,13 @@ func (e *Engine) ImportDHCPLeases(leases []dhcp.Lease) DHCPImportResult {
 		existing, found, _ := e.findDeviceLocked(mac, lease.IP, host)
 		if !found {
 			id := ScopedDeviceID(netKey, mac, lease.IP)
+			vendor := oui.LookupVendorLocal(mac)
 			dev := &Device{
 				ID:           id,
 				NetworkKey:   netKey,
 				IP:           lease.IP,
 				MAC:          mac,
-				Vendor:       oui.LookupVendor(mac),
+				Vendor:       vendor,
 				Hostname:     host,
 				NameSource:   mdns.NameSourceDHCP,
 				DeviceType:   "Network Device",
@@ -108,6 +113,8 @@ func (e *Engine) ImportDHCPLeases(leases []dhcp.Lease) DHCPImportResult {
 		d := foundEvents[i]
 		e.recordEvent("found", d.ID, "DHCP lease "+d.DisplayName())
 		e.emitEvent("device_found", &d)
+		// Local OUI may have missed; let Tier 3 fill vendor/type over the network.
+		e.enqueueIfStale(d, now)
 	}
 	for i := range updatedEvents {
 		d := updatedEvents[i]

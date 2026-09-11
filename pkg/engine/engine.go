@@ -9,12 +9,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/notify"
 	"github.com/jaredwarren/Gofing/pkg/ports"
+	"github.com/jaredwarren/Gofing/pkg/probes"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
@@ -71,6 +73,11 @@ type Engine struct {
 	mu        sync.RWMutex
 	devices   map[string]*Device // keyed by stable Device.ID
 	missCount map[string]int     // consecutive scan misses per device ID
+	// verifyMiss counts consecutive failures of the patient verification probe.
+	// Kept apart from missCount because ARP hits reset that one on every
+	// intervening pass, which would otherwise make verification unable to ever
+	// retire a device whose kernel ARP entry outlives its departure.
+	verifyMiss map[string]int
 
 	// settingsMu guards settings alone. Every tier timer reads it on each tick
 	// and fireAlert reads it on every transition, none of which concerns the
@@ -82,20 +89,29 @@ type Engine struct {
 	listenersMu sync.RWMutex
 	listeners   []EventFunc
 
+	// alertMu guards the per-device alert damping timestamps. Separate from
+	// e.mu because fireAlert runs on every presence transition and has nothing
+	// to do with the device map.
+	alertMu     sync.Mutex
+	lastAlertAt map[string]time.Time
+
 	portScanMu       sync.Mutex
 	portScanInflight map[string]bool
 	netScanner       *scanner.Scanner
 	mdnsResolver     *mdns.Resolver
 	persist          Persistence
-	warmHostFn       func(ip string)
-	deepLookupFn     func(r *mdns.Resolver, ip string) mdns.LookupResult
+	warmHostFn       func(ctx context.Context, ip string)
+	deepLookupFn     func(ctx context.Context, r *mdns.Resolver, ip string) mdns.LookupResult
 	activeNetworkKey string
 	activeSubnetCIDR string
 	netInfo          *network.Info // cached active network; refreshed by currentNetInfo
 	netInfoAt        time.Time
+	netDetectFn      func() (*network.Info, error) // tests override OS network detection
 	discCtx          context.Context
 	probeFn          func(ctx context.Context, ip string) (latency float64, ok bool)
 	arpFn            func(ctx context.Context) ([]scanner.RawDevice, error)
+	verifyFn         func(ctx context.Context, ip string) (latency float64, ok bool)
+	presencePass     atomic.Uint64 // presence tick counter; paces verification passes
 	sweepFn          func(ctx context.Context, subnetCIDR, iface string, skipHits map[string]float64, progress func(int, int)) ([]scanner.RawDevice, error)
 	notifyFn         func(title, message string) error
 	startupPresence  bool // true until the first presence pass; suppresses launch online alerts
@@ -107,9 +123,10 @@ type Engine struct {
 	lastPresence  PresenceResult // newest Tier-1 snapshot; feeds the sweep's skip list
 
 	// Tier 3: queue-driven fingerprinting.
-	enrichQ   *enrichQueue
-	resolveFn func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails
-	vendorFn  func(mac string) string
+	enrichQ     *enrichQueue
+	resolveFn   func(ctx context.Context, in mdns.ResolveInput) mdns.DeviceDetails
+	vendorFn    func(mac string) string
+	deepProbeFn func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult
 }
 
 // New returns an initialized Engine. persist may be nil (in-memory only).
@@ -117,14 +134,16 @@ func New(persist Persistence) *Engine {
 	e := &Engine{
 		devices:          make(map[string]*Device),
 		missCount:        make(map[string]int),
+		lastAlertAt:      make(map[string]time.Time),
+		verifyMiss:       make(map[string]int),
 		portScanInflight: make(map[string]bool),
 		enrichQ:          newEnrichQueue(),
 		netScanner:       scanner.New(),
 		mdnsResolver:     mdns.New(),
 		persist:          persist,
 		warmHostFn:       warmHost,
-		deepLookupFn: func(r *mdns.Resolver, ip string) mdns.LookupResult {
-			return r.LookupHostnameDeep(ip)
+		deepLookupFn: func(ctx context.Context, r *mdns.Resolver, ip string) mdns.LookupResult {
+			return r.LookupHostnameDeepCtx(ctx, ip)
 		},
 		startupPresence: true,
 	}
@@ -209,13 +228,18 @@ func (e *Engine) loadFromStore() {
 	if err != nil || len(loaded) == 0 {
 		return
 	}
+	var pruned []string
+
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	for i := range loaded {
 		d := loaded[i]
 		d.IsOnline = false
 		if d.ID == "" {
 			d.ID = DeviceID(d.MAC, d.IP)
+		}
+		if isPhantomRow(d) {
+			pruned = append(pruned, d.ID)
+			continue
 		}
 		d.Hostname, d.NameSource = mdns.PreferHostname("", mdns.NameSourceNone, d.Hostname, d.NameSource)
 		if d.Hostname == "" {
@@ -231,6 +255,49 @@ func (e *Engine) loadFromStore() {
 		cp := d
 		e.devices[cp.ID] = &cp
 	}
+	for _, dev := range e.devices {
+		if dev.Hostname == "" || isGenericHostname(dev.Hostname) {
+			e.adoptDeviceMetadataLocked(dev)
+			if dev.Hostname == "" {
+				if bestName, bestSrc := e.findBestNameLocked(dev); bestName != "" {
+					dev.Hostname = bestName
+					dev.NameSource = bestSrc
+				}
+			}
+		}
+	}
+	e.mu.Unlock()
+
+	// Deleting is I/O, so it happens after the lock is released.
+	for _, id := range pruned {
+		e.deletePersisted(id)
+	}
+	if len(pruned) > 0 {
+		slog.Info("pruned phantom device rows with no Layer-2 identity",
+			"pruned", len(pruned), "kept", len(loaded)-len(pruned))
+	}
+}
+
+// isPhantomRow reports whether a persisted device is an artifact of the probe
+// false positives the sweep used to accept: an address that answered a
+// concurrent probe but never had an ARP entry, recorded with no MAC and never
+// given a name, vendor or type.
+//
+// Such a row can never be matched again — identity needs a MAC, and the
+// address gets reused — so it can only sit offline or flap. It is dropped on
+// load, but only when it carries nothing a person put there: a custom name,
+// note, type override, learned hostname, prior MAC or port-scan result all
+// mean keep it and let the user decide.
+func isPhantomRow(d Device) bool {
+	if d.MAC != "" {
+		return false
+	}
+	return d.Hostname == "" &&
+		d.CustomName == "" &&
+		d.Note == "" &&
+		d.DeviceTypeOverride == "" &&
+		len(d.PreviousMACs) == 0 &&
+		len(d.OpenPorts) == 0
 }
 
 // RegisterEventListener adds a subscriber for scan events.
@@ -293,8 +360,13 @@ func (e *Engine) recordEvent(typ, deviceID, message string) {
 // SetActiveNetwork updates which LAN inventory is visible. Call when Wi‑Fi/network changes.
 func (e *Engine) SetActiveNetwork(info *network.Info) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.setActiveNetworkLocked(info)
+	migrated, deleted := e.reconcileScopedIDsLocked()
+	e.mu.Unlock()
+	for _, id := range deleted {
+		e.deletePersisted(id)
+	}
+	e.persistDevices(migrated)
 }
 
 func (e *Engine) setActiveNetworkLocked(info *network.Info) {
@@ -309,11 +381,125 @@ func (e *Engine) setActiveNetworkLocked(info *network.Info) {
 	if prev != "" && e.activeNetworkKey != "" && prev != e.activeNetworkKey {
 		// Drop miss counters for the previous LAN; they are not offline on this network.
 		for id, dev := range e.devices {
-			if dev.NetworkKey == prev {
+			if networkKeysEquivalent(dev.NetworkKey, prev) {
 				e.missCount[id] = 0
 			}
 		}
 	}
+}
+
+// reconcileScopedIDsLocked remounts devices onto the sanitized active network key.
+// Repairs: wired SSID placeholders, legacy CIDR-slash gw/subnet keys, and IDs
+// corrupted by first-slash stripNetworkScope. Caller holds e.mu.
+func (e *Engine) reconcileScopedIDsLocked() (migrated []Device, deleted []string) {
+	netKey := e.activeNetworkKey
+	if netKey == "" {
+		return nil, nil
+	}
+
+	type pending struct {
+		oldID string
+		dev   *Device
+	}
+	var work []pending
+	for id, d := range e.devices {
+		if !e.deviceNeedsReconcileLocked(d) {
+			continue
+		}
+		desiredID := ScopedDeviceID(netKey, d.MAC, d.IP)
+		if desiredID == "" {
+			continue
+		}
+		if id == desiredID && d.NetworkKey == netKey {
+			continue
+		}
+		work = append(work, pending{oldID: id, dev: d})
+	}
+
+	for _, w := range work {
+		d := w.dev
+		oldID := w.oldID
+		desiredID := ScopedDeviceID(netKey, d.MAC, d.IP)
+		if desiredID == "" {
+			continue
+		}
+		if oldID != desiredID {
+			delete(e.devices, oldID)
+			if mc, ok := e.missCount[oldID]; ok {
+				delete(e.missCount, oldID)
+				e.missCount[desiredID] = mc
+			}
+			// Prefer keeping an already-correct row if both old and new exist.
+			if existing, ok := e.devices[desiredID]; ok && existing != d {
+				mergeDevicePreferRicher(existing, d)
+				d = existing
+			} else {
+				d.ID = desiredID
+				e.devices[desiredID] = d
+			}
+			deleted = append(deleted, oldID)
+			e.enrichQ.rekey(oldID, desiredID)
+		}
+		d.NetworkKey = netKey
+		d.ID = desiredID
+		if d.Hostname == "" || isGenericHostname(d.Hostname) {
+			e.adoptDeviceMetadataLocked(d)
+			if d.Hostname == "" {
+				if bestName, bestSrc := e.findBestNameLocked(d); bestName != "" {
+					d.Hostname = bestName
+					d.NameSource = bestSrc
+				}
+			}
+		}
+		e.devices[desiredID] = d
+		migrated = append(migrated, *d)
+	}
+	return migrated, deleted
+}
+
+func mergeDevicePreferRicher(dst, src *Device) {
+	if dst == nil || src == nil || dst == src {
+		return
+	}
+	if src.LastSeen.After(dst.LastSeen) {
+		dst.LastSeen = src.LastSeen
+		dst.IP = src.IP
+		dst.LatencyMs = src.LatencyMs
+	}
+	if dst.MAC == "" {
+		dst.MAC = src.MAC
+	}
+	if dst.CustomName == "" && src.CustomName != "" {
+		dst.CustomName = src.CustomName
+	}
+	if dst.Hostname == "" || isGenericHostname(dst.Hostname) {
+		if src.Hostname != "" && !isGenericHostname(src.Hostname) {
+			dst.Hostname = src.Hostname
+			dst.NameSource = src.NameSource
+		}
+	}
+	if (dst.Vendor == "" || isGenericLabel(dst.Vendor)) && src.Vendor != "" && !isGenericLabel(src.Vendor) {
+		dst.Vendor = src.Vendor
+	}
+	if (dst.DeviceType == "" || isGenericLabel(dst.DeviceType)) && src.DeviceType != "" {
+		dst.DeviceType = src.DeviceType
+		dst.Icon = src.Icon
+		dst.Model = src.Model
+	}
+	if src.IsOnline {
+		dst.IsOnline = true
+	}
+	for _, m := range src.PreviousMACs {
+		dst.PreviousMACs = appendUniqueMAC(dst.PreviousMACs, m)
+	}
+}
+
+// networkKeysEquivalent treats sanitized and legacy slash-containing gw/subnet keys as the same LAN.
+func networkKeysEquivalent(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return normalizeStoredNetworkKey(a) == normalizeStoredNetworkKey(b)
 }
 
 // GetDevices returns devices for the active network only, sorted by IP.
@@ -340,12 +526,34 @@ func (e *Engine) deviceVisibleLocked(dev *Device) bool {
 	if e.activeNetworkKey == "" {
 		return true
 	}
-	if dev.NetworkKey == e.activeNetworkKey {
+	if networkKeysEquivalent(dev.NetworkKey, e.activeNetworkKey) {
+		return true
+	}
+	// Old wired placeholder SSID key — show if still on this subnet.
+	if isWiredPlaceholderKey(dev.NetworkKey) && ipInCIDR(dev.IP, e.activeSubnetCIDR) {
 		return true
 	}
 	// Legacy rows (pre-network-key): show only if IP is on the active subnet.
 	if dev.NetworkKey == "" && ipInCIDR(dev.IP, e.activeSubnetCIDR) {
 		return true
+	}
+	return false
+}
+
+// deviceNeedsReconcileLocked is true when a visible/legacy row should be remounted
+// onto the sanitized active network key. Caller holds e.mu.
+func (e *Engine) deviceNeedsReconcileLocked(dev *Device) bool {
+	if e.deviceVisibleLocked(dev) {
+		return true
+	}
+	// Corrupted IDs may have a mismatched NetworkKey vs map key; still migrate if
+	// the device IP is on the active subnet and the stored key is gw/subnet-shaped
+	// or from a wired placeholder.
+	if e.activeSubnetCIDR != "" && ipInCIDR(dev.IP, e.activeSubnetCIDR) {
+		nk := normalizeStoredNetworkKey(dev.NetworkKey)
+		if strings.HasPrefix(nk, "gw:") || strings.HasPrefix(nk, "subnet:") || isWiredPlaceholderKey(dev.NetworkKey) {
+			return true
+		}
 	}
 	return false
 }
@@ -359,6 +567,20 @@ func (e *Engine) GetDevice(id string) (Device, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	d, ok := e.devices[id]
+	if !ok {
+		base := stripNetworkScope(id)
+		if e.activeNetworkKey != "" {
+			d, ok = e.devices[e.activeNetworkKey+"/"+base]
+		}
+		if !ok {
+			for _, dev := range e.devices {
+				if stripNetworkScope(dev.ID) == base {
+					d, ok = dev, true
+					break
+				}
+			}
+		}
+	}
 	if !ok {
 		return Device{}, false
 	}
@@ -402,8 +624,11 @@ type NameResolveResult struct {
 }
 
 // ResolveDeviceName force-fetches Bonjour/DNS names for a device and persists
-// an upgrade via ranked PreferHostname.
-func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
+// an upgrade via ranked PreferHostname. ctx bounds the network probes.
+func (e *Engine) ResolveDeviceName(ctx context.Context, id string) (NameResolveResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dev, ok := e.GetDevice(id)
 	if !ok {
 		return NameResolveResult{}, fmt.Errorf("device not found")
@@ -414,7 +639,7 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 
 	// Nudge the host so macOS may refresh ARP / mDNS cache entries.
 	if e.warmHostFn != nil {
-		e.warmHostFn(dev.IP)
+		e.warmHostFn(ctx, dev.IP)
 	}
 
 	var candidates []mdns.NameCandidate
@@ -435,7 +660,7 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 
 	var deep mdns.LookupResult
 	if e.deepLookupFn != nil {
-		deep = e.deepLookupFn(e.mdnsResolver, dev.IP)
+		deep = e.deepLookupFn(ctx, e.mdnsResolver, dev.IP)
 	}
 	for _, c := range deep.Candidates {
 		consider(c.Hostname, c.Source)
@@ -482,7 +707,10 @@ func (e *Engine) ResolveDeviceName(id string) (NameResolveResult, error) {
 }
 
 // LookupDeviceNames returns reverse-DNS / Bonjour candidates without mutating state.
-func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
+func (e *Engine) LookupDeviceNames(ctx context.Context, id string) (mdns.LookupResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dev, ok := e.GetDevice(id)
 	if !ok {
 		return mdns.LookupResult{}, fmt.Errorf("device not found")
@@ -491,11 +719,11 @@ func (e *Engine) LookupDeviceNames(id string) (mdns.LookupResult, error) {
 		return mdns.LookupResult{}, nil
 	}
 	if e.warmHostFn != nil {
-		e.warmHostFn(dev.IP)
+		e.warmHostFn(ctx, dev.IP)
 	}
 	var res mdns.LookupResult
 	if e.deepLookupFn != nil {
-		res = e.deepLookupFn(e.mdnsResolver, dev.IP)
+		res = e.deepLookupFn(ctx, e.mdnsResolver, dev.IP)
 	}
 	if arpName := e.netScanner.ARPHostname(dev.IP); arpName != "" {
 		if h := mdns.SanitizeHostname(arpName); h != "" {
@@ -525,34 +753,44 @@ func (e *Engine) SetEnrichTestHooks(
 	e.vendorFn = vendor
 }
 
+// SetProbeTestHook overrides deep device fingerprinting probes for unit testing.
+func (e *Engine) SetProbeTestHook(probe func(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.deepProbeFn = probe
+}
+
+func (e *Engine) probeDevice(ctx context.Context, ip string, knownPorts []int) probes.ProbeResult {
+	e.mu.RLock()
+	fn := e.deepProbeFn
+	isTestResolve := e.resolveFn != nil
+	e.mu.RUnlock()
+	if fn != nil {
+		return fn(ctx, ip, knownPorts)
+	}
+	if isTestResolve {
+		return probes.ProbeResult{IP: ip}
+	}
+	return probes.ProbeDevice(ctx, ip, knownPorts)
+}
+
 // SetTestHooks configures custom network lookup functions for unit testing.
-func (e *Engine) SetTestHooks(warmHost func(ip string), deepLookup func(r *mdns.Resolver, ip string) mdns.LookupResult) {
+func (e *Engine) SetTestHooks(warmHost func(ctx context.Context, ip string), deepLookup func(ctx context.Context, r *mdns.Resolver, ip string) mdns.LookupResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.warmHostFn = warmHost
 	e.deepLookupFn = deepLookup
 }
 
-func warmHost(ip string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+func warmHost(ctx context.Context, ip string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "500", ip)
+	cmd := exec.CommandContext(pingCtx, "ping", "-c", "1", "-W", "500", ip)
 	_ = cmd.Run()
 }
-
-func (e *Engine) backgroundNameResolve(id string) {
-	select {
-	case nameResolveSem <- struct{}{}:
-		defer func() { <-nameResolveSem }()
-	default:
-		// Already resolving other devices; scan path / manual button can retry.
-		return
-	}
-	_, _ = e.ResolveDeviceName(id)
-}
-
-// Limits concurrent background deep lookups during discovery.
-var nameResolveSem = make(chan struct{}, 2)
 
 // ErrPortScanInProgress is returned when a port scan for the device is already running.
 var ErrPortScanInProgress = fmt.Errorf("port scan already in progress")
@@ -573,12 +811,17 @@ func (e *Engine) endPortScan(id string) {
 	delete(e.portScanInflight, id)
 }
 
+const (
+	portScanCommonBudget = 30 * time.Second
+	portScanDeepBudget   = 60 * time.Second
+)
+
 // TryStartPortScan validates and launches an async port scan. started=false means
 // one is already in flight for this device (not an error).
-func (e *Engine) TryStartPortScan(ctx context.Context, id, mode string) (started bool, err error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+//
+// The caller's context is intentionally unused: the scan runs on a detached
+// timeout so an HTTP handler returning after scan_started cannot cancel it.
+func (e *Engine) TryStartPortScan(_ context.Context, id, mode string) (started bool, err error) {
 	if _, ok := e.GetDevice(id); !ok {
 		return false, fmt.Errorf("device not found")
 	}
@@ -592,9 +835,15 @@ func (e *Engine) TryStartPortScan(ctx context.Context, id, mode string) (started
 	if !e.tryBeginPortScan(id) {
 		return false, nil
 	}
+	budget := portScanCommonBudget
+	if mode == "deep" {
+		budget = portScanDeepBudget
+	}
+	scanCtx, cancel := context.WithTimeout(context.Background(), budget)
 	go func() {
+		defer cancel()
 		defer e.endPortScan(id)
-		if _, err := e.runPortScan(ctx, id, mode); err != nil {
+		if _, err := e.runPortScan(scanCtx, id, mode); err != nil {
 			slog.Error("port scan failed", "id", id, "mode", mode, "error", err)
 			e.emitEvent("portscan_error", map[string]interface{}{
 				"id":    id,
@@ -691,6 +940,16 @@ type upsertOpts struct {
 	Persist    bool // false when the caller batch-persists the whole pass afterwards
 	EmitFound  bool
 	EmitUpdate bool
+
+	// RequireMACForNew refuses to *create* a device from a row with no MAC.
+	// Such a row may still update a device already known at that IP.
+	//
+	// Without this, any probe false positive becomes a permanent inventory
+	// entry: MAC-less, nameless, vendorless, and never matchable again once the
+	// address is reused, so it can only ever sit offline or flap. A device on a
+	// directly-connected subnet always has a MAC; if we could not learn one,
+	// we have not identified a device.
+	RequireMACForNew bool
 }
 
 // upsertDevice merges a scanned host into inventory using stable identity rules,
@@ -713,6 +972,11 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 	existing, found, previousMAC := e.findDeviceLocked(normMAC, raw.IP, details.Hostname)
 
 	if !found {
+		if normMAC == "" && opts.RequireMACForNew {
+			e.mu.Unlock()
+			slog.Debug("discarded device with no Layer-2 identity", "ip", raw.IP)
+			return ""
+		}
 		desiredID := ScopedDeviceID(netKey, normMAC, raw.IP)
 		host, src := mdns.PreferHostname("", mdns.NameSourceNone, details.Hostname, details.NameSource)
 		newDev := &Device{
@@ -728,11 +992,20 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 			Model:        details.Model,
 			Services:     details.Services,
 			LatencyMs:    raw.LatencyMs,
-			IsOnline:     true,
 			IsPrivateMAC: private,
 			FirstSeen:    now,
 			LastSeen:     now,
 		}
+		if newDev.Hostname == "" || isGenericHostname(newDev.Hostname) {
+			e.adoptDeviceMetadataLocked(newDev)
+			if newDev.Hostname == "" {
+				if bestName, bestSrc := e.findBestNameLocked(newDev); bestName != "" {
+					newDev.Hostname = bestName
+					newDev.NameSource = bestSrc
+				}
+			}
+		}
+		e.setOnlineLocked(newDev, true)
 		e.devices[desiredID] = newDev
 		e.missCount[desiredID] = 0
 		out := *newDev
@@ -745,10 +1018,7 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 		if opts.EmitFound {
 			e.emitEvent("device_found", &out)
 		}
-		e.fireAlert("new_device", out.ID, fmt.Sprintf("New device: %s (%s)", out.DisplayName(), out.IP))
-		if out.Hostname == "" {
-			go e.backgroundNameResolve(out.ID)
-		}
+		e.fireAlert(AlertRuleNewDevice, out.ID, fmt.Sprintf("New device: %s (%s)", out.DisplayName(), out.IP))
 		return desiredID
 	}
 
@@ -760,7 +1030,7 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 	}
 	cameOnline := !wasPreviouslyOnline
 
-	existing.IsOnline = true
+	e.setOnlineLocked(existing, true)
 	existing.LastSeen = now
 	existing.LatencyMs = raw.LatencyMs
 	existing.IP = raw.IP
@@ -775,7 +1045,9 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 		}
 		existing.MAC = normMAC
 		existing.IsPrivateMAC = private
-		existing.Vendor = macVendor
+		if existing.Vendor == "" || isGenericLabel(existing.Vendor) || !isGenericLabel(macVendor) {
+			existing.Vendor = macVendor
+		}
 	}
 
 	// Remount ID when adding network scope or upgrading ip:→MAC; keep base ID
@@ -796,6 +1068,15 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 	}
 
 	applyDetailsLocked(existing, details, "")
+	if existing.Hostname == "" || isGenericHostname(existing.Hostname) {
+		e.adoptDeviceMetadataLocked(existing)
+		if existing.Hostname == "" {
+			if bestName, bestSrc := e.findBestNameLocked(existing); bestName != "" {
+				existing.Hostname = bestName
+				existing.NameSource = bestSrc
+			}
+		}
+	}
 	e.missCount[existing.ID] = 0
 	if oldID != existing.ID {
 		if wasOnline != nil {
@@ -821,16 +1102,23 @@ func (e *Engine) upsertDeviceOpts(raw scanner.RawDevice, details mdns.DeviceDeta
 	}
 	if cameOnline {
 		e.recordEvent("online", out.ID, fmt.Sprintf("%s is online", out.DisplayName()))
-		e.fireAlert("device_online", out.ID, fmt.Sprintf("%s came back online", out.DisplayName()))
-		if out.Hostname == "" {
-			go e.backgroundNameResolve(out.ID)
-		}
+		e.fireAlert(AlertRuleDeviceOnline, out.ID, fmt.Sprintf("%s came back online", out.DisplayName()))
 	}
 	if opts.EmitUpdate && (cameOnline || migratedFrom != "" ||
 		deviceChangedMeaningfully(beforeUpsert, out)) {
 		e.emitEvent("device_updated", &out)
 	}
 	return out.ID
+}
+
+// setOnlineLocked is the single writer for Device.IsOnline (besides startup
+// load which forces false). Any tier may prove a device present; only Tier 1
+// declares absence. Caller must hold e.mu.
+func (e *Engine) setOnlineLocked(d *Device, online bool) {
+	if d == nil {
+		return
+	}
+	d.IsOnline = online
 }
 
 // applyDetailsLocked merges resolved fingerprint details into d using the ranked
@@ -887,6 +1175,144 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
+// applyProbeResultLocked integrates findings from deep protocol probes into d.
+// Returns true if any user-visible field changed. Caller must hold e.mu.
+func applyProbeResultLocked(d *Device, res probes.ProbeResult) bool {
+	before := *d
+
+	// 1. UPnP / SSDP
+	if res.UPnP != nil {
+		if res.UPnP.ModelName != "" && (d.Model == "" || isGenericHostname(d.Model)) {
+			d.Model = res.UPnP.ModelName
+			if res.UPnP.ModelNumber != "" && !strings.Contains(d.Model, res.UPnP.ModelNumber) {
+				d.Model = fmt.Sprintf("%s (%s)", d.Model, res.UPnP.ModelNumber)
+			}
+		}
+		if res.UPnP.Manufacturer != "" && (!vendorKnown(d.Vendor) || strings.EqualFold(d.Vendor, "generic") || strings.EqualFold(d.Vendor, "unknown")) {
+			d.Vendor = res.UPnP.Manufacturer
+		}
+		if res.UPnP.FriendlyName != "" {
+			d.Hostname, d.NameSource = mdns.PreferHostname(
+				d.Hostname, d.NameSource,
+				res.UPnP.FriendlyName, mdns.NameSourceUPnP,
+			)
+		}
+		d.Services = addServiceTag(d.Services, "UPnP")
+	}
+
+	// 2. NetBIOS
+	if res.NetBIOS != nil {
+		if res.NetBIOS.ComputerName != "" {
+			d.Hostname, d.NameSource = mdns.PreferHostname(
+				d.Hostname, d.NameSource,
+				res.NetBIOS.ComputerName, mdns.NameSourceNetBIOS,
+			)
+		}
+		d.Services = addServiceTag(d.Services, "NetBIOS")
+		if res.NetBIOS.Workgroup != "" {
+			d.Services = addServiceTag(d.Services, "Workgroup: "+res.NetBIOS.Workgroup)
+		}
+	}
+
+	// 3. Roku ECP — the owner-assigned name ("Living room 2"), plus an exact
+	// model. Checked before TLS because it is a far stronger identity signal.
+	if res.Roku != nil {
+		if res.Roku.Name != "" {
+			d.Hostname, d.NameSource = mdns.PreferHostname(
+				d.Hostname, d.NameSource,
+				res.Roku.Name, mdns.NameSourceECP,
+			)
+		}
+		if res.Roku.ModelName != "" && (d.Model == "" || isGenericHostname(d.Model)) {
+			d.Model = res.Roku.ModelName
+			if res.Roku.ModelNumber != "" && !strings.Contains(d.Model, res.Roku.ModelNumber) {
+				d.Model = fmt.Sprintf("%s (%s)", d.Model, res.Roku.ModelNumber)
+			}
+		}
+		if res.Roku.VendorName != "" && !vendorKnown(d.Vendor) {
+			d.Vendor = res.Roku.VendorName
+		}
+		if d.DeviceType == "" || d.DeviceType == "Generic Device" {
+			d.DeviceType = "Media Player"
+			d.Icon = "tv"
+		}
+		d.Services = addServiceTag(d.Services, "Roku ECP")
+	}
+
+	// 4. TLS Certificate
+	if res.TLS != nil {
+		if res.TLS.SubjectCN != "" {
+			d.Hostname, d.NameSource = mdns.PreferHostname(
+				d.Hostname, d.NameSource,
+				res.TLS.SubjectCN, mdns.NameSourceTLS,
+			)
+		}
+		d.Services = addServiceTag(d.Services, "TLS Cert")
+	}
+
+	return before.Hostname != d.Hostname ||
+		before.NameSource != d.NameSource ||
+		before.Model != d.Model ||
+		before.Vendor != d.Vendor ||
+		!sameStrings(before.Services, d.Services)
+}
+
+func addServiceTag(services []string, tag string) []string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return services
+	}
+	for _, s := range services {
+		if strings.EqualFold(s, tag) {
+			return services
+		}
+	}
+	return append(services, tag)
+}
+
+// ProbeDevice executes multi-protocol fingerprinting against a device on demand,
+// merges findings, persists, emits device_updated, and returns the probe results.
+func (e *Engine) ProbeDevice(ctx context.Context, id string) (probes.ProbeResult, Device, error) {
+	dev, ok := e.GetDevice(id)
+	if !ok {
+		return probes.ProbeResult{}, Device{}, fmt.Errorf("device not found")
+	}
+	if dev.IP == "" {
+		return probes.ProbeResult{}, dev, fmt.Errorf("device has no IP address")
+	}
+
+	var openPorts []int
+	for _, sp := range dev.OpenPorts {
+		openPorts = append(openPorts, sp.Port)
+	}
+
+	res := e.probeDevice(ctx, dev.IP, openPorts)
+
+	e.mu.Lock()
+	d, ok := e.devices[dev.ID]
+	if !ok {
+		base := stripNetworkScope(dev.ID)
+		if e.activeNetworkKey != "" {
+			d, ok = e.devices[e.activeNetworkKey+"/"+base]
+		}
+	}
+	if !ok {
+		e.mu.Unlock()
+		return res, dev, fmt.Errorf("device disappeared during probe")
+	}
+
+	changed := applyProbeResultLocked(d, res)
+	out := *d
+	e.mu.Unlock()
+
+	if changed {
+		e.persistDevice(out)
+		e.emitEvent("device_updated", &out)
+	}
+
+	return res, out, nil
+}
+
 // findDeviceLocked resolves an existing device by MAC, IP fallback, or private-MAC hostname merge.
 // Only matches devices on the active network (or legacy unscoped rows). Must hold e.mu.
 func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, found bool, previousMAC string) {
@@ -900,7 +1326,7 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 		}
 		// Legacy unscoped MAC key from before network scoping.
 		if d, ok := e.devices[DeviceID(normMAC, "")]; ok {
-			if d.NetworkKey == "" || d.NetworkKey == netKey {
+			if d.NetworkKey == "" || networkKeysEquivalent(d.NetworkKey, netKey) {
 				return d, true, ""
 			}
 		}
@@ -926,7 +1352,7 @@ func (e *Engine) findDeviceLocked(normMAC, ip, hostname string) (dev *Device, fo
 			}
 		}
 		if d, ok := e.devices[DeviceID("", ip)]; ok {
-			if d.NetworkKey == "" || d.NetworkKey == netKey {
+			if d.NetworkKey == "" || networkKeysEquivalent(d.NetworkKey, netKey) {
 				return d, true, ""
 			}
 		}
@@ -964,7 +1390,10 @@ func (e *Engine) sameNetworkLocked(d *Device) bool {
 	if e.activeNetworkKey == "" {
 		return true
 	}
-	if d.NetworkKey == e.activeNetworkKey {
+	if networkKeysEquivalent(d.NetworkKey, e.activeNetworkKey) {
+		return true
+	}
+	if isWiredPlaceholderKey(d.NetworkKey) && ipInCIDR(d.IP, e.activeSubnetCIDR) {
 		return true
 	}
 	if d.NetworkKey == "" {
@@ -977,10 +1406,159 @@ func isGenericHostname(hostname string) bool {
 	switch strings.ToLower(strings.TrimSpace(hostname)) {
 	case "iphone", "ipad", "android", "dhcp", "workstation", "generic", "device",
 		"laptop", "computer", "pc", "macbook", "network", "unknown", "host", "local",
-		"android-dhcp", "kindle", "galaxy", "home", "lan", "gateway", "router":
+		"android-dhcp", "kindle", "galaxy", "home", "lan", "gateway", "router",
+		"apple device", "network device", "standard network hardware", "unknown vendor",
+		"unknown device",
+		"private / randomized mac", "private mac", "randomized mac", "private / randomized mac address":
 		return true
 	default:
 		return false
+	}
+}
+
+// findBestNameLocked searches existing inventory, previous MACs, mDNS cache, and ARP
+// to match the best available hostname/custom name for a device.
+// Caller must hold e.mu (at least RLock).
+func (e *Engine) findBestNameLocked(target *Device) (name, source string) {
+	if target == nil {
+		return "", ""
+	}
+	normMAC := NormalizeMAC(target.MAC)
+
+	// 1. Match by MAC across all known devices (including PreviousMACs)
+	if normMAC != "" {
+		for _, d := range e.devices {
+			if d == target || !e.sameNetworkLocked(d) {
+				continue
+			}
+			matched := (d.MAC != "" && NormalizeMAC(d.MAC) == normMAC)
+			if !matched {
+				for _, prev := range d.PreviousMACs {
+					if NormalizeMAC(prev) == normMAC {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched && len(target.PreviousMACs) > 0 {
+				for _, prev := range target.PreviousMACs {
+					if NormalizeMAC(prev) == NormalizeMAC(d.MAC) {
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				if d.CustomName != "" {
+					return d.CustomName, "custom"
+				}
+				if d.Hostname != "" && !isGenericLabel(d.Hostname) {
+					return d.Hostname, d.NameSource
+				}
+				if d.Model != "" && !isGenericLabel(d.Model) {
+					return d.Model, "model"
+				}
+			}
+		}
+	}
+
+	// 2. Match by IP across all known devices on this network
+	if target.IP != "" {
+		for _, d := range e.devices {
+			if d == target || !e.sameNetworkLocked(d) {
+				continue
+			}
+			if d.IP == target.IP {
+				if d.CustomName != "" {
+					return d.CustomName, "custom"
+				}
+				if d.Hostname != "" && !isGenericLabel(d.Hostname) {
+					return d.Hostname, d.NameSource
+				}
+				if d.Model != "" && !isGenericLabel(d.Model) {
+					return d.Model, "model"
+				}
+			}
+		}
+	}
+
+	// 3. Check mDNS resolver cached name (in-memory, non-blocking)
+	if e.mdnsResolver != nil && target.IP != "" {
+		if cached, src := e.mdnsResolver.CachedName(target.IP); cached != "" && !isGenericLabel(cached) {
+			return cached, src
+		}
+	}
+
+	return "", ""
+}
+
+// adoptDeviceMetadataLocked copies non-generic metadata (hostname, custom name, model, vendor, device type)
+// from matching records in inventory (matching by MAC, PreviousMACs, or IP).
+// Caller must hold e.mu.
+func (e *Engine) adoptDeviceMetadataLocked(target *Device) {
+	if target == nil {
+		return
+	}
+	normMAC := NormalizeMAC(target.MAC)
+	for _, d := range e.devices {
+		if d == target || !e.sameNetworkLocked(d) {
+			continue
+		}
+		matched := false
+		if normMAC != "" && d.MAC != "" && NormalizeMAC(d.MAC) == normMAC {
+			matched = true
+		}
+		if !matched && normMAC != "" {
+			for _, prev := range d.PreviousMACs {
+				if NormalizeMAC(prev) == normMAC {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched && len(target.PreviousMACs) > 0 && d.MAC != "" {
+			for _, prev := range target.PreviousMACs {
+				if NormalizeMAC(prev) == NormalizeMAC(d.MAC) {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched && target.IP != "" && d.IP == target.IP {
+			matched = true
+		}
+		if matched {
+			if target.IsPrivateMAC {
+				if d.MAC != "" && NormalizeMAC(d.MAC) != normMAC {
+					target.PreviousMACs = appendUniqueMAC(target.PreviousMACs, d.MAC)
+				}
+				for _, prev := range d.PreviousMACs {
+					target.PreviousMACs = appendUniqueMAC(target.PreviousMACs, prev)
+				}
+			}
+			if target.Hostname == "" || isGenericHostname(target.Hostname) {
+				if d.Hostname != "" && !isGenericHostname(d.Hostname) {
+					target.Hostname = d.Hostname
+					target.NameSource = d.NameSource
+				} else if d.Model != "" && !isGenericLabel(d.Model) {
+					target.Hostname = d.Model
+					target.NameSource = "model"
+				}
+			}
+			if target.CustomName == "" && d.CustomName != "" {
+				target.CustomName = d.CustomName
+			}
+			if (target.Model == "" || isGenericLabel(target.Model)) && d.Model != "" && !isGenericLabel(d.Model) {
+				target.Model = d.Model
+			}
+			if (target.DeviceType == "" || isGenericLabel(target.DeviceType)) && d.DeviceType != "" && !isGenericLabel(d.DeviceType) {
+				target.DeviceType = d.DeviceType
+				target.Icon = d.Icon
+			}
+			if (target.Vendor == "" || isGenericLabel(target.Vendor)) && d.Vendor != "" && !isGenericLabel(d.Vendor) {
+				target.Vendor = d.Vendor
+			}
+		}
 	}
 }
 

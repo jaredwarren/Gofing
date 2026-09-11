@@ -67,7 +67,8 @@ func TestSanitizeHostname(t *testing.T) {
 		{"\x00\x01\x02", ""},
 		{"���$�", ""}, // replacement-char junk
 		{"$", ""},
-		{"A", ""}, // too short / not enough alnum
+		{"A", ""},               // too short / not enough alnum
+		{"AAAAAAAAAAAAAAA", ""}, // NBNS question padding
 		{"", ""},
 	}
 
@@ -94,5 +95,72 @@ func TestIsNetBIOSStyleName(t *testing.T) {
 	}
 	if isNetBIOSStyleName("Amy's Mac") {
 		t.Error("apostrophe names are not NetBIOS style")
+	}
+	if isNetBIOSStyleName("AAAAAAAAAAAAAAA") {
+		t.Error("monotone padding must not pass as a NetBIOS name")
+	}
+}
+
+func TestParseNetBIOSNodeStatusIgnoresQuestionPadding(t *testing.T) {
+	// Minimal NBSTAT reply: header + echoed "*" question (CK + A-padding) +
+	// one answer whose RDATA carries unique name "LIVING-ROOM-PC".
+	msg := []byte{
+		// Header: tid, flags, qd=1, an=1, ns=0, ar=0
+		0x80, 0x94, 0x84, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		// Question name: len=32, CK + 30×'A', nul, type NBSTAT, class IN
+		0x20, 0x43, 0x4b,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x00, 0x00, 0x21, 0x00, 0x01,
+		// Answer: pointer to question name, type, class, ttl, rdlength
+		0xc0, 0x0c, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x13, // rdlength = 1 + 18
+		0x01, // num names
+		// "LIVING-ROOM-PC" space-padded to 15, suffix 0x00, unique flags 0x0400
+		'L', 'I', 'V', 'I', 'N', 'G', '-', 'R', 'O', 'O', 'M', '-', 'P', 'C', ' ',
+		0x00, 0x04, 0x00,
+	}
+
+	got := parseNetBIOSNodeStatus(msg)
+	if got != "LIVING-ROOM-PC" {
+		t.Fatalf("got %q want LIVING-ROOM-PC", got)
+	}
+}
+
+func TestParseNetBIOSNodeStatusNoAnswer(t *testing.T) {
+	// Question-only packet — sliding-window parsers falsely return AAAAAAAAAAAAAAA.
+	msg := []byte{
+		0x80, 0x94, 0x84, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x20, 0x43, 0x4b,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+		0x00, 0x00, 0x21, 0x00, 0x01,
+	}
+	if got := parseNetBIOSNodeStatus(msg); got != "" {
+		t.Fatalf("expected empty, got %q", got)
+	}
+}
+
+func TestParseNetBIOSNodeStatusSkipsGroupNames(t *testing.T) {
+	msg := []byte{
+		0x80, 0x94, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		// Answer owner: root label only
+		0x00, 0x00, 0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x25, // rdlength = 1 + 18*2
+		0x02,
+		// Group WORKGROUP (flags group bit set)
+		'W', 'O', 'R', 'K', 'G', 'R', 'O', 'U', 'P', ' ', ' ', ' ', ' ', ' ', ' ',
+		0x00, 0x80, 0x00,
+		// Unique DESKTOP-ABC
+		'D', 'E', 'S', 'K', 'T', 'O', 'P', '-', 'A', 'B', 'C', ' ', ' ', ' ', ' ',
+		0x00, 0x04, 0x00,
+	}
+	got := parseNetBIOSNodeStatus(msg)
+	if got != "DESKTOP-ABC" {
+		t.Fatalf("got %q want DESKTOP-ABC", got)
 	}
 }

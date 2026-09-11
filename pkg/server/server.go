@@ -11,11 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/dhcp"
 	"github.com/jaredwarren/Gofing/pkg/engine"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/notify"
+	"github.com/jaredwarren/Gofing/pkg/version"
 )
 
 // Server encapsulates the HTTP API, SSE streaming, and embedded frontend delivery.
@@ -45,6 +47,7 @@ func New(devEngine *engine.Engine, staticFS fs.FS) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.HandleFunc("/api/network", s.handleNetworkInfo)
 	mux.HandleFunc("/api/devices", s.handleDevicesRoot)
 	mux.HandleFunc("/api/devices/", s.handleDeviceSubpath)
@@ -59,6 +62,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/", fileServer)
 
 	return mux
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, version.Get())
 }
 
 func (s *Server) handleNetworkInfo(w http.ResponseWriter, r *http.Request) {
@@ -86,10 +97,12 @@ func (s *Server) handleDevicesRoot(w http.ResponseWriter, r *http.Request) {
 // deviceActions are the recognized /api/devices/{id}/<action> suffixes.
 var deviceActions = map[string]bool{
 	"history":      true,
+	"recheck":      true,
 	"rdns":         true,
 	"resolve-name": true,
 	"portscan":     true,
 	"enrich":       true,
+	"probe":        true,
 }
 
 // handleDeviceSubpath serves /api/devices/{id} and /api/devices/{id}/<action>.
@@ -168,6 +181,15 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if action == "recheck" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleRecheck(w, r, id)
+		return
+	}
+
 	if action == "enrich" {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -177,7 +199,47 @@ func (s *Server) handleDeviceSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if action == "probe" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleProbeDevice(w, r, id)
+		return
+	}
+
 	http.NotFound(w, r)
+}
+
+// handleProbeDevice executes on-demand multi-protocol probing against a device.
+func (s *Server) handleProbeDevice(w http.ResponseWriter, r *http.Request, id string) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	probeRes, dev, err := s.devEngine.ProbeDevice(ctx, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"status": "success",
+		"probe":  probeRes,
+		"device": dev,
+	})
+}
+
+// handleRecheck re-evaluates one device's presence on demand.
+//
+// Unlike the port scan, this runs synchronously: it takes a second or two, the
+// caller is a person waiting for an answer, and the answer is the response
+// body. It uses the request context so a closed tab cancels the probe.
+func (s *Server) handleRecheck(w http.ResponseWriter, r *http.Request, id string) {
+	res, err := s.devEngine.RecheckDevice(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, res)
 }
 
 // handleEnrich queues a fingerprint refresh. The work runs on the enrichment
@@ -237,7 +299,7 @@ func (s *Server) handleDeviceHistory(w http.ResponseWriter, r *http.Request, id 
 }
 
 func (s *Server) handleDeviceRDNS(w http.ResponseWriter, r *http.Request, id string) {
-	res, err := s.devEngine.LookupDeviceNames(id)
+	res, err := s.devEngine.LookupDeviceNames(r.Context(), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -258,7 +320,7 @@ func (s *Server) handleDeviceRDNS(w http.ResponseWriter, r *http.Request, id str
 }
 
 func (s *Server) handleResolveName(w http.ResponseWriter, r *http.Request, id string) {
-	res, err := s.devEngine.ResolveDeviceName(id)
+	res, err := s.devEngine.ResolveDeviceName(r.Context(), id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -299,7 +361,7 @@ func (s *Server) handlePortScan(w http.ResponseWriter, r *http.Request, id strin
 }
 
 func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -389,7 +451,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// No Access-Control-Allow-Origin: the SPA is same-origin. A wildcard CORS
+	// header would let any webpage stream the LAN inventory via EventSource.
 
 	clientChan := make(chan string, 50)
 

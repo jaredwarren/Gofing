@@ -20,6 +20,7 @@
         </div>
         <span class="brand-title">Gofing</span>
         <span class="brand-badge">macOS Native</span>
+        <span class="version-badge" id="versionBadge" title="Build version and timestamp">...</span>
       </div>
 
       <div class="network-meta-pill" id="networkPill">
@@ -72,10 +73,29 @@
 
     <section class="activity-section" aria-label="Activity feed">
       <div class="activity-header">
-        <h2 class="activity-title">Activity</h2>
+        <div class="activity-title-group">
+          <h2 class="activity-title">Activity</h2>
+          <div class="activity-filter-pills" id="activityFilterPills">
+            <button type="button" class="act-pill active" data-act-filter="all">All</button>
+            <button type="button" class="act-pill" data-act-filter="online">Online</button>
+            <button type="button" class="act-pill" data-act-filter="offline">Offline</button>
+          </div>
+        </div>
         <div class="activity-toggles">
           <label class="activity-toggle"><input type="checkbox" id="alertsEnabledChk" checked> Alerts</label>
           <label class="activity-toggle"><input type="checkbox" id="notifyMacosChk" checked> macOS notify</label>
+          <label class="activity-toggle"><input type="checkbox" id="alertOnlineChk" checked> Online</label>
+          <label class="activity-toggle"><input type="checkbox" id="alertOfflineChk" checked> Offline</label>
+          <label class="activity-toggle" title="Minimum gap between two alerts about the same device">
+            Repeat
+            <select id="alertCooldownSel" class="activity-select">
+              <option value="0">no limit</option>
+              <option value="60">1 min</option>
+              <option value="300">5 min</option>
+              <option value="900">15 min</option>
+              <option value="3600">1 hour</option>
+            </select>
+          </label>
         </div>
       </div>
       <ul class="activity-feed" id="activityFeed">
@@ -91,6 +111,7 @@
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
         <input type="text" id="searchInput" placeholder="Search by name, IP, MAC address, vendor, or model..." />
+        <button type="button" class="search-clear" id="searchClearBtn" aria-label="Clear search" hidden>&times;</button>
       </div>
 
       <div class="category-pills" id="categoryPills">
@@ -239,10 +260,29 @@
 
         <section class="drawer-tab-panel" id="tab-tools">
           <div class="tools-panel">
-            <p class="tools-hint">Force a Bonjour / reverse-DNS lookup for this device. Higher-quality names stick across rescans.</p>
-            <button type="button" class="btn-tool" id="btnResolveName">Resolve name</button>
-            <div class="tool-status" id="toolResolveStatus"></div>
-            <div class="tool-output" id="toolResolveOutput" hidden></div>
+            <div class="tool-card">
+              <h3 class="tool-card-title">Check Status Now</h3>
+              <p class="tools-hint">Re-check this device immediately. Reports which signal decided it: a resolved ARP entry means present at Layer&nbsp;2 even when the device ignores ping.</p>
+              <button type="button" class="btn-tool" id="btnRecheck">Check now</button>
+              <div class="tool-status" id="toolRecheckStatus"></div>
+              <div class="tool-output" id="toolRecheckOutput" hidden></div>
+            </div>
+
+            <div class="tool-card" style="margin-top: 16px;">
+              <h3 class="tool-card-title">Deep Fingerprint</h3>
+              <p class="tools-hint">Probe multi-protocol attributes (UPnP/SSDP, NetBIOS, TLS Certificate) for exact model, manufacturer, and hostname.</p>
+              <button type="button" class="btn-tool" id="btnDeepProbe">Deep Fingerprint</button>
+              <div class="tool-status" id="toolProbeStatus"></div>
+              <div class="probe-result-card" id="toolProbeCard" hidden></div>
+            </div>
+
+            <div class="tool-card" style="margin-top: 16px;">
+              <h3 class="tool-card-title">Name Resolution</h3>
+              <p class="tools-hint">Force a Bonjour / reverse-DNS lookup for this device. Higher-quality names stick across rescans.</p>
+              <button type="button" class="btn-tool" id="btnResolveName">Resolve name</button>
+              <div class="tool-status" id="toolResolveStatus"></div>
+              <div class="tool-output" id="toolResolveOutput" hidden></div>
+            </div>
           </div>
         </section>
 

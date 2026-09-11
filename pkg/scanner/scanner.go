@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -166,31 +168,49 @@ func applySkipHits(pingResults, skipHits map[string]float64) {
 	}
 }
 
-// mergeProbeAndARP returns probe-responsive hosts plus complete ARP entries that
-// sit on the scanned subnet (and iface, when set). The ping sweep already
-// provoked ARP for every address; a complete row is L2 evidence even when ICMP
-// and TCP are blocked. Stale ARP may linger until the OS expires it.
+// mergeProbeAndARP returns hosts on the scanned subnet, evidenced by a complete
+// ARP entry. The ping sweep's job is to provoke ARP resolution for every
+// address and to measure latency; the ARP table is what decides who exists.
+//
+// A probe reply is NOT accepted on its own. On a directly-connected subnet a
+// host cannot exchange IP packets without a resolved ARP entry, so a
+// "reachable" address with no complete row is a probe artifact — and under the
+// sweep's 48-way concurrency macOS produces them readily: measured on a quiet
+// /24, five addresses reported sub-millisecond TCP connects while being
+// unreachable to any serial probe and sitting at `(incomplete)` in the ARP
+// table. Trusting those replies invented a phantom device per address, each
+// one MAC-less, nameless and permanently offline, and marked genuinely absent
+// devices online for a sweep at a time.
+//
+// Stale ARP may linger until the OS expires it; the presence tier's
+// verification pass is what retires those.
 func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevice, subnetCIDR, iface string, now time.Time) []RawDevice {
 	seen := make(map[string]bool, len(pingResults)+len(arpByIP))
 	var result []RawDevice
+	iface = strings.TrimSpace(iface)
+
+	onScannedIface := func(arp RawDevice) bool {
+		return iface == "" || arp.Iface == "" || strings.EqualFold(arp.Iface, iface)
+	}
 
 	for ip, lat := range pingResults {
-		dev := RawDevice{
+		arp, ok := arpByIP[ip]
+		if !ok || arp.MAC == "" || !onScannedIface(arp) {
+			// No Layer-2 evidence: discard rather than report a host.
+			continue
+		}
+		seen[ip] = true
+		result = append(result, RawDevice{
 			IP:        ip,
+			MAC:       arp.MAC,
+			Iface:     arp.Iface,
+			Hostname:  arp.Hostname,
 			LatencyMs: lat,
 			IsOnline:  true,
 			LastSeen:  now,
-		}
-		if arp, ok := arpByIP[ip]; ok {
-			dev.MAC = arp.MAC
-			dev.Iface = arp.Iface
-			dev.Hostname = arp.Hostname
-		}
-		seen[ip] = true
-		result = append(result, dev)
+		})
 	}
 
-	iface = strings.TrimSpace(iface)
 	for ip, arp := range arpByIP {
 		if seen[ip] {
 			continue
@@ -201,7 +221,7 @@ func mergeProbeAndARP(pingResults map[string]float64, arpByIP map[string]RawDevi
 		if subnetCIDR != "" && !ipInCIDR(ip, subnetCIDR) {
 			continue
 		}
-		if iface != "" && arp.Iface != "" && !strings.EqualFold(arp.Iface, iface) {
+		if !onScannedIface(arp) {
 			continue
 		}
 		arp.IsOnline = true
@@ -307,6 +327,13 @@ func probeTCPParallel(ctx context.Context, ip string, timeout time.Duration) boo
 			var d net.Dialer
 			conn, err := d.DialContext(dialCtx, "tcp", net.JoinHostPort(ip, port))
 			if err != nil {
+				if isTCPRefused(err) {
+					select {
+					case hit <- struct{}{}:
+						cancel()
+					default:
+					}
+				}
 				return
 			}
 			_ = conn.Close()
@@ -334,6 +361,17 @@ func probeTCPParallel(ctx context.Context, ip string, timeout time.Duration) boo
 	}
 }
 
+func isTCPRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sysErr syscall.Errno
+	if errors.As(err, &sysErr) && sysErr == syscall.ECONNREFUSED {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "connection refused")
+}
+
 func pingIPFast(ctx context.Context, ip string) (float64, bool) {
 	// TCP probes first, all ports at once. Dialing them in sequence cost ~800ms
 	// per unreachable host — the dominant term in a /24 sweep — for no more
@@ -350,15 +388,73 @@ func pingIPFast(ctx context.Context, ip string) (float64, bool) {
 	return pingOnce(ctx, ip, 500*time.Millisecond)
 }
 
+// ProbeIPVerify is the patient reachability check used to confirm or retire a
+// device that Layer-2 (ARP) still vouches for.
+//
+// Power-saving devices — phones, tablets, watches — duty-cycle their Wi-Fi
+// radio on roughly a 0.3-0.5s period, and many answer no TCP port at all, so
+// ICMP is the only signal. A single packet, or several packets spaced closely
+// together, all land in the same sleep window and are simply lost: measured
+// against a sleeping iPad, `-c 1 -W 400` hit 0/8 and `-c 3 -i 0.2` hit 1/8,
+// while `-c 3 -i 0.5` hit 8/8. Spacing the packets across separate wake
+// windows is what makes the probe reliable.
+//
+// Costs ~1-2s, so call it on a slow cadence, not every presence pass.
+func ProbeIPVerify(ctx context.Context, ip string) (float64, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	start := time.Now()
+	// A more patient TCP window than the quick probe: this LAN shows RTTs up to
+	// ~190ms, where a 100ms dial gives up too early.
+	if ok := probeTCPParallel(ctx, ip, 300*time.Millisecond); ok {
+		return float64(time.Since(start).Microseconds()) / 1000.0, true
+	}
+	return pingPackets(ctx, ip, time.Second, verifyPingCount, verifyPingInterval)
+}
+
+// Verification ping shape. The interval must exceed a power-saving radio's
+// sleep window; 500ms is empirically sufficient and stays unprivileged
+// (macOS restricts `-i` below 0.1s to root).
+const (
+	verifyPingCount    = 3
+	verifyPingInterval = 500 * time.Millisecond
+)
+
 func pingOnce(parentCtx context.Context, ip string, timeout time.Duration) (float64, bool) {
-	ctx, cancel := context.WithTimeout(parentCtx, timeout+200*time.Millisecond)
+	return pingPackets(parentCtx, ip, timeout, 1, 0)
+}
+
+// pingPackets sends count ICMP echoes spaced interval apart, succeeding if any
+// is answered. timeout is the per-reply wait (`ping -W`).
+func pingPackets(parentCtx context.Context, ip string, timeout time.Duration, count int, interval time.Duration) (float64, bool) {
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	if count < 1 {
+		count = 1
+	}
+
+	// Budget: every inter-packet gap, plus the final reply wait, plus slack for
+	// process spawn. Too tight a budget kills ping before its last packet and
+	// silently turns a reachable host into a miss.
+	budget := timeout + 200*time.Millisecond
+	if count > 1 {
+		budget += time.Duration(count-1) * interval
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, budget)
 	defer cancel()
 
 	waitMs := int(timeout / time.Millisecond)
 	if waitMs < 1 {
 		waitMs = 1
 	}
-	cmd := exec.CommandContext(ctx, "ping", "-c", "1", "-W", strconv.Itoa(waitMs), ip)
+	args := []string{"-c", strconv.Itoa(count), "-W", strconv.Itoa(waitMs)}
+	if count > 1 && interval > 0 {
+		args = append(args, "-i", strconv.FormatFloat(interval.Seconds(), 'f', -1, 64))
+	}
+	args = append(args, ip)
+	cmd := exec.CommandContext(ctx, "ping", args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
@@ -401,17 +497,28 @@ func (s *Scanner) parsemacOSARPTable(ctx context.Context, numeric bool) ([]RawDe
 		ctx = context.Background()
 	}
 	// `-a` includes mDNS/Bonjour hostnames when macOS has them cached, at the
-	// cost of a reverse lookup per entry. `-an` skips both.
+	// cost of a reverse lookup per entry.
+	// On macOS, `-n -l -a` includes linklayer reachability (expirations & probe retries)
+	// without hostname reverse-lookups. `-an` is used as a fallback if `-l` is unsupported.
 	args := []string{"-a"}
 	if numeric {
-		args = []string{"-an"}
+		args = []string{"-n", "-l", "-a"}
 	}
 	cmd := exec.CommandContext(ctx, "arp", args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		if numeric {
+			out.Reset()
+			cmd = exec.CommandContext(ctx, "arp", "-an")
+			cmd.Stdout = &out
+			if err := cmd.Run(); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	return parseARPTableOutput(out.String(), time.Now()), nil
@@ -437,26 +544,58 @@ func parseARPTableOutput(text string, now time.Time) []RawDevice {
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		matches := arpLineRe.FindStringSubmatch(line)
-		if len(matches) < 5 {
+		if line == "" || strings.HasPrefix(line, "Neighbor") {
 			continue
 		}
-		name := matches[1]
-		ip := matches[2]
-		macRaw := matches[3]
-		iface := matches[4]
+
+		var ip, macRaw, iface, hostname string
+		var expired bool
+
+		// Check Format 1: `arp -n -l -a`
+		// e.g. "192.168.0.1 54:af:97:14:cf:7c 2m38s 2m30s en0 1"
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && net.ParseIP(fields[0]) != nil {
+			ip = fields[0]
+			macRaw = fields[1]
+			expO := strings.ToLower(fields[2])
+			expI := strings.ToLower(fields[3])
+			iface = fields[4]
+			prbs := ""
+			if len(fields) >= 7 {
+				prbs = fields[6]
+			}
+
+			// An ARP entry is dead/unreachable if:
+			// 1) Both outgoing and incoming timers expired (exp_o == expired && exp_i == expired)
+			// 2) Incoming traffic expired and kernel ARP probe retries failed (exp_i == expired && prbs > 0)
+			if expO == "expired" && expI == "expired" {
+				expired = true
+			}
+			if expI == "expired" && prbs != "" && prbs != "0" {
+				expired = true
+			}
+		} else if matches := arpLineRe.FindStringSubmatch(line); len(matches) >= 5 {
+			// Format 2: classic `arp -a` / `arp -an`
+			// e.g. "? (192.168.0.1) at 54:af:97:14:cf:7c on en0 ..."
+			if matches[1] != "?" {
+				hostname = matches[1]
+			}
+			ip = matches[2]
+			macRaw = matches[3]
+			iface = matches[4]
+		} else {
+			continue
+		}
+
+		if expired || macRaw == "(incomplete)" {
+			continue
+		}
 
 		formattedMAC := formatMAC(macRaw)
-
-		if macRaw == "(incomplete)" || formattedMAC == "FF:FF:FF:FF:FF:FF" ||
+		if formattedMAC == "FF:FF:FF:FF:FF:FF" ||
 			strings.HasPrefix(formattedMAC, "01:00:5E") || strings.HasPrefix(formattedMAC, "33:33:") ||
 			isMulticastIP(ip) {
 			continue
-		}
-
-		hostname := ""
-		if name != "?" {
-			hostname = name
 		}
 
 		devices = append(devices, RawDevice{

@@ -218,8 +218,8 @@ func (db *DB) LookupVendor(mac string) string {
 		return result
 	}
 
-	// 4. Query maclookup.app API
-	apiVendor := db.queryMACLookupAPI(clean)
+	// 4. Query maclookup.app API with the OUI prefix only (never the full MAC).
+	apiVendor := db.queryMACLookupAPI(prefix)
 	if apiVendor != "" {
 		norm := normalizeVendor(apiVendor)
 		db.cacheMu.Lock()
@@ -232,8 +232,14 @@ func (db *DB) LookupVendor(mac string) string {
 	return "Generic Device"
 }
 
-func (db *DB) queryMACLookupAPI(cleanMAC string) string {
-	url := "https://api.maclookup.app/v2/macs/" + cleanMAC
+// queryMACLookupAPI asks maclookup.app for a vendor. cleanPrefix must be the
+// 6-hex OUI only — never a full MAC — so a unique NIC address is not disclosed.
+func (db *DB) queryMACLookupAPI(cleanPrefix string) string {
+	if len(cleanPrefix) < 6 {
+		return ""
+	}
+	prefix := cleanPrefix[:6]
+	url := "https://api.maclookup.app/v2/macs/" + prefix
 	resp, err := db.httpClient.Get(url)
 	if err != nil {
 		return ""

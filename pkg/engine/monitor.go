@@ -98,8 +98,20 @@ func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
 	if patch.AlertsEnabled != nil {
 		e.settings.AlertsEnabled = *patch.AlertsEnabled
 	}
+	if patch.AlertOnline != nil {
+		e.settings.AlertOnline = *patch.AlertOnline
+	}
+	if patch.AlertOffline != nil {
+		e.settings.AlertOffline = *patch.AlertOffline
+	}
+	if patch.AlertCooldownSec != nil {
+		e.settings.AlertCooldownSec = clampCooldown(*patch.AlertCooldownSec)
+	}
 	if patch.NotifymacOS != nil {
 		e.settings.NotifymacOS = *patch.NotifymacOS
+	}
+	if patch.RemoteOUILookup != nil {
+		e.settings.RemoteOUILookup = *patch.RemoteOUILookup
 	}
 	out := e.settings
 	e.settingsMu.Unlock()
@@ -112,18 +124,87 @@ func (e *Engine) UpdateSettings(patch SettingsPatch) (Settings, error) {
 	return out, nil
 }
 
-func (e *Engine) fireAlert(rule, deviceID, message string) {
+// Alert rules. These are the values carried in Alert.Rule and the keys the
+// per-rule notification toggles apply to.
+const (
+	AlertRuleNewDevice     = "new_device"
+	AlertRuleDeviceOnline  = "device_online"
+	AlertRuleDeviceOffline = "device_offline"
+)
+
+// alertRuleEnabled reports whether the user wants to hear about this rule.
+func (e *Engine) alertRuleEnabled(rule string) bool {
 	e.settingsMu.RLock()
-	enabled := e.settings.AlertsEnabled
+	defer e.settingsMu.RUnlock()
+	if !e.settings.AlertsEnabled {
+		return false
+	}
+	switch rule {
+	case AlertRuleDeviceOnline:
+		return e.settings.AlertOnline
+	case AlertRuleDeviceOffline:
+		return e.settings.AlertOffline
+	default:
+		return true
+	}
+}
+
+// dampedRule reports whether a rule is subject to the per-device damping
+// window. Only the presence transitions are: they are the pair that can
+// alternate indefinitely. A new-device alert fires once in a device's life, so
+// damping it would achieve nothing while letting it consume the window would
+// silence the first genuine departure of every device just discovered.
+func dampedRule(rule string) bool {
+	return rule == AlertRuleDeviceOnline || rule == AlertRuleDeviceOffline
+}
+
+// allowAlertNow applies the per-device damping window. It records the alert
+// time when it allows one through, so callers must only call it once per alert.
+//
+// Damping is keyed by device rather than by rule: a device whose reachability
+// is marginal alternates offline and online, so rate-limiting each rule
+// separately would still let the pair through together.
+func (e *Engine) allowAlertNow(deviceID string, now time.Time) bool {
+	cooldown := e.alertCooldown()
+	if cooldown <= 0 || deviceID == "" {
+		return true
+	}
+	e.alertMu.Lock()
+	defer e.alertMu.Unlock()
+	if last, ok := e.lastAlertAt[deviceID]; ok && now.Sub(last) < cooldown {
+		return false
+	}
+	if e.lastAlertAt == nil {
+		e.lastAlertAt = make(map[string]time.Time)
+	}
+	e.lastAlertAt[deviceID] = now
+	return true
+}
+
+// fireAlert records a presence alert and, subject to the per-rule toggles and
+// the damping window, notifies the user.
+//
+// Suppression here does not hide the underlying transition: the caller has
+// already recorded the online/offline event and emitted the device update, so
+// the history and the UI stay complete. Only the interruption is dropped.
+func (e *Engine) fireAlert(rule, deviceID, message string) {
+	if !e.alertRuleEnabled(rule) {
+		return
+	}
+	if dampedRule(rule) && !e.allowAlertNow(deviceID, time.Now()) {
+		slog.Debug("alert damped", "rule", rule, "id", deviceID,
+			"cooldown", e.alertCooldown())
+		return
+	}
+
+	e.settingsMu.RLock()
 	desktop := e.settings.NotifymacOS
 	e.settingsMu.RUnlock()
 
 	e.mu.RLock()
 	notifyFn := e.notifyFn
 	e.mu.RUnlock()
-	if !enabled {
-		return
-	}
+
 	alert := Alert{
 		Rule:      rule,
 		DeviceID:  deviceID,

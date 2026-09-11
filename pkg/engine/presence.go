@@ -17,6 +17,13 @@ import (
 // below the discovery sweep's fan-out without costing wall time.
 const presenceConcurrency = 16
 
+// presenceVerifyEvery is how many presence passes separate two verification
+// passes. At the default 10s cadence that is roughly every 70s, so a device
+// whose ARP entry lingers after it leaves is retired within a few minutes
+// (offlineMissThreshold verification failures) without the patient probe
+// running often enough to matter.
+const presenceVerifyEvery = 6
+
 // arpCacheTTL is how long a parsed ARP table may be reused. The kernel table
 // does not change meaningfully faster than this, and a pass used to exec arp
 // two or three times within a couple of seconds.
@@ -32,10 +39,9 @@ type PresenceResult struct {
 // PresenceOnce probes known inventory on the active network and reconciles
 // online/offline state.
 //
-// This is Tier 1: it is the sole owner of Device.IsOnline and missCount, and it
-// is deliberately not gated on the discovery or enrichment tiers. Blocking it
-// while a full scan ran is what used to leave presence detection dead for two
-// thirds of every cycle.
+// This is Tier 1: it is the only tier allowed to declare a device *absent*
+// (after offlineMissThreshold misses). Any tier may prove presence. It is
+// deliberately not gated on the discovery or enrichment tiers.
 func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) PresenceResult {
 	if ctx == nil {
 		ctx = context.Background()
@@ -64,9 +70,17 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 		iface = strings.TrimSpace(netInfo.InterfaceName)
 	}
 
+	// Stamp the network key this pass is accounting against. If discovery or
+	// currentNetInfo flips activeNetworkKey mid-pass, discard the apply — the
+	// probe targets were selected for a different LAN.
+	e.mu.RLock()
+	passNetworkKey := e.activeNetworkKey
+	e.mu.RUnlock()
+
 	// Phase 1: the ARP table is free Layer-2 evidence, so use it before probing.
 	arpStart := time.Now()
 	arpConfirmed := make(map[string]string) // IP -> MAC
+	arpByMAC := make(map[string]string)     // Normalized MAC -> IP
 	for _, row := range e.readARP(ctx) {
 		if row.MAC == "" {
 			continue
@@ -78,12 +92,43 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 			continue
 		}
 		arpConfirmed[row.IP] = row.MAC
+		arpByMAC[NormalizeMAC(row.MAC)] = row.IP
 	}
 
-	// Phase 2: snapshot what to probe. Anything ARP already vouched for is
-	// skipped — that check is what keeps a busy LAN off the probe path.
+	// Phase 2: decide, per device, what evidence this pass will rest on.
+	//
+	// An entry in the kernel ARP table is strong Layer-2 evidence: it is there
+	// because the device is actually talking on this LAN. It is also *more*
+	// reliable than a single active probe, because power-saving devices
+	// duty-cycle their radio and answer ICMP only intermittently — measured on
+	// a sleeping iPad, the quick probe hit 0/20 while the device was plainly
+	// present in ARP and answering 60% of patient pings. Probing every device
+	// every pass produced 3-miss offline flips every ~35s, then an immediate
+	// re-online: constant false churn.
+	//
+	// So: ARP vouching keeps a device online without a probe. Devices ARP does
+	// *not* vouch for are probed every pass, which is where fast departure
+	// detection comes from.
+	//
+	// Verification passes exist to keep the ARP evidence honest, and they judge
+	// by ARP rather than by the probe reply. A probe reply cannot be the
+	// arbiter of departure: a Nintendo Switch in standby and a sleeping iPad
+	// both answer no ICMP and open no ports, yet are demonstrably present —
+	// their ARP entries stay resolved under repeated probing while 230 of the
+	// 261 entries on the same LAN sit at `(incomplete)`. Requiring a reply
+	// retired exactly the devices ARP-first was added to keep.
+	//
+	// What the verification probe is really for is provocation: macOS
+	// revalidates a link-layer entry roughly every arp_llreach_base seconds
+	// (120 here) but only when something uses it, and ARP-vouched devices are
+	// otherwise never touched. The probe forces that use; the post-probe ARP
+	// re-read is the verdict. A departed device fails revalidation, drops to
+	// `(incomplete)`, and is then retired on the normal miss threshold.
+	verifyPass := e.nextPresencePass()%presenceVerifyEvery == 0
+
 	type target struct {
 		id, ip string
+		verify bool // use the patient probe; a miss counts even though ARP vouches
 	}
 	var (
 		targets   []target
@@ -92,17 +137,44 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 	)
 	e.mu.RLock()
 	for _, d := range e.devices {
-		if !e.deviceVisibleLocked(d) || d.IP == "" {
+		if !e.deviceVisibleLocked(d) {
 			continue
 		}
-		if mac, ok := arpConfirmed[d.IP]; ok {
-			if d.MAC == "" || NormalizeMAC(mac) == NormalizeMAC(d.MAC) {
-				arpHits = append(arpHits, target{id: d.ID, ip: d.IP})
-				seenByARP[d.ID] = true
-				continue
+		normMAC := NormalizeMAC(d.MAC)
+
+		// Follow the device to a new IP when ARP knows its MAC there.
+		ipToProbe := d.IP
+		if normMAC != "" {
+			if newIP, ok := arpByMAC[normMAC]; ok && newIP != "" {
+				ipToProbe = newIP
 			}
 		}
-		targets = append(targets, target{id: d.ID, ip: d.IP})
+
+		arpVouches := false
+		if d.IP != "" {
+			if mac, ok := arpConfirmed[d.IP]; ok && (normMAC == "" || NormalizeMAC(mac) == normMAC) {
+				arpVouches = true
+			}
+		}
+		if !arpVouches && normMAC != "" {
+			if newIP, ok := arpByMAC[normMAC]; ok && newIP != "" {
+				arpVouches = true
+			}
+		}
+
+		if arpVouches {
+			if verifyPass && ipToProbe != "" {
+				targets = append(targets, target{id: d.ID, ip: ipToProbe, verify: true})
+				continue
+			}
+			arpHits = append(arpHits, target{id: d.ID, ip: ipToProbe})
+			seenByARP[d.ID] = true
+			continue
+		}
+
+		if ipToProbe != "" {
+			targets = append(targets, target{id: d.ID, ip: ipToProbe})
+		}
 	}
 	e.mu.RUnlock()
 
@@ -114,6 +186,7 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 		id, ip string
 		lat    float64
 		ok     bool
+		verify bool
 	}
 	results := make([]hit, len(targets))
 	if len(targets) > 0 {
@@ -125,16 +198,78 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 				defer wg.Done()
 				select {
 				case <-ctx.Done():
-					results[i] = hit{id: t.id, ip: t.ip}
+					results[i] = hit{id: t.id, ip: t.ip, verify: t.verify}
 					return
 				case sem <- struct{}{}:
 				}
 				defer func() { <-sem }()
-				lat, ok := e.probeIPQuick(ctx, t.ip)
-				results[i] = hit{id: t.id, ip: t.ip, lat: lat, ok: ok}
+				probe := e.probeIPQuick
+				if t.verify {
+					probe = e.probeIPVerify
+				}
+				lat, ok := probe(ctx, t.ip)
+				results[i] = hit{id: t.id, ip: t.ip, lat: lat, ok: ok, verify: t.verify}
 			}(i, t)
 		}
 		wg.Wait()
+
+		// If any probed targets did not respond to ICMP/TCP (e.g. stealth mode,
+		// firewalled, or sleeping mobile devices), re-read the ARP table.
+		// Probing provokes the OS kernel to send an ARP request at Layer 2.
+		// Since readARPFresh filters out incomplete, expired, and failed-probe
+		// entries, any host verified in postARPConfirmed is alive at Layer 2.
+		var hasMisses bool
+		for _, r := range results {
+			if !r.ok {
+				hasMisses = true
+				break
+			}
+		}
+		if hasMisses {
+			postARPConfirmed := make(map[string]string) // IP -> MAC
+			postARPByMAC := make(map[string]string)     // MAC -> IP
+			for _, row := range e.readARPFresh(ctx) {
+				if row.MAC == "" {
+					continue
+				}
+				if subnet != "" && !ipInCIDR(row.IP, subnet) {
+					continue
+				}
+				if iface != "" && row.Iface != "" && !strings.EqualFold(row.Iface, iface) {
+					continue
+				}
+				postARPConfirmed[row.IP] = row.MAC
+				postARPByMAC[NormalizeMAC(row.MAC)] = row.IP
+			}
+			if len(postARPConfirmed) > 0 {
+				e.mu.RLock()
+				for i, r := range results {
+					if r.ok {
+						continue
+					}
+					d, ok := e.devices[r.id]
+					if !ok {
+						continue
+					}
+					normMAC := NormalizeMAC(d.MAC)
+					// Check if MAC appeared under a new IP
+					if normMAC != "" {
+						if newIP, found := postARPByMAC[normMAC]; found && newIP != "" && newIP != r.ip {
+							results[i].ip = newIP
+							results[i].ok = true
+							continue
+						}
+					}
+					if mac, found := postARPConfirmed[r.ip]; found {
+						if normMAC == "" || NormalizeMAC(mac) == normMAC {
+							results[i].ok = true
+							continue
+						}
+					}
+				}
+				e.mu.RUnlock()
+			}
+		}
 	}
 
 	probeTook := time.Since(probeStart)
@@ -152,14 +287,27 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 	)
 
 	e.mu.Lock()
-	applyHit := func(id, ip string, lat float64) {
+	if passNetworkKey != "" && e.activeNetworkKey != passNetworkKey {
+		activeKey := e.activeNetworkKey
+		e.mu.Unlock()
+		slog.Debug("presence apply discarded: network changed mid-pass",
+			"pass_key", passNetworkKey, "active_key", activeKey,
+			"probed", len(targets), "arp_hits", len(arpHits))
+		e.setLastPresence(res)
+		return res
+	}
+	// fromProbe distinguishes an active probe reply from Layer-2 ARP evidence.
+	// Only a reply clears the verification counter: ARP says the kernel has an
+	// address mapping, which persists for minutes after a device leaves, so it
+	// must not erase the record of the patient probe failing.
+	applyHit := func(id, ip string, lat float64, fromProbe bool) {
 		d, ok := e.devices[id]
 		if !ok {
 			return // rekeyed mid-pass; the next tick picks it up
 		}
 		snap := *d
 		wasOff := !d.IsOnline
-		d.IsOnline = true
+		e.setOnlineLocked(d, true)
 		d.LastSeen = now
 		if lat > 0 {
 			d.LatencyMs = lat
@@ -168,6 +316,9 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 			d.IP = ip
 		}
 		e.missCount[id] = 0
+		if fromProbe {
+			delete(e.verifyMiss, id)
+		}
 		res.Hits[d.IP] = lat
 		res.IDs[id] = true
 		before[id] = snap
@@ -179,11 +330,18 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 	}
 
 	for _, t := range arpHits {
-		applyHit(t.id, t.ip, 0)
+		// Layer-2 evidence maintains presence, but it cannot restore a device
+		// the patient probe has already proven absent — only a probe success
+		// (on the next verification pass) may do that. Without this, a departed
+		// device with a lingering ARP entry would oscillate every verify cycle.
+		if e.verifyMiss[t.id] >= offlineMissThreshold {
+			continue
+		}
+		applyHit(t.id, t.ip, 0, false)
 	}
 	for _, r := range results {
 		if r.ok {
-			applyHit(r.id, r.ip, r.lat)
+			applyHit(r.id, r.ip, r.lat, true)
 			continue
 		}
 		d, ok := e.devices[r.id]
@@ -197,9 +355,18 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 		if d.LastSeen.After(passStart) {
 			continue
 		}
-		e.missCount[r.id]++
-		if e.missCount[r.id] >= offlineMissThreshold && d.IsOnline {
-			d.IsOnline = false
+
+		// A verification miss — probed, and still not in ARP afterwards — is
+		// counted separately. ARP keeps resetting missCount on the intervening
+		// passes, so a shared counter could never accumulate enough
+		// verification failures to retire a device whose entry has gone stale.
+		counter := e.missCount
+		if r.verify {
+			counter = e.verifyMiss
+		}
+		counter[r.id]++
+		if counter[r.id] >= offlineMissThreshold && d.IsOnline {
+			e.setOnlineLocked(d, false)
 			wentOffline = append(wentOffline, *d)
 		}
 	}
@@ -226,7 +393,7 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 		e.persistDevice(d)
 		if !suppressAlerts {
 			e.recordEvent("online", d.ID, fmt.Sprintf("%s is online", d.DisplayName()))
-			e.fireAlert("device_online", d.ID, fmt.Sprintf("%s came back online", d.DisplayName()))
+			e.fireAlert(AlertRuleDeviceOnline, d.ID, fmt.Sprintf("%s came back online", d.DisplayName()))
 		}
 		e.emitEvent("device_updated", &d)
 		// A sleeping device should get named the moment it wakes, which the old
@@ -239,7 +406,7 @@ func (e *Engine) PresenceOnce(ctx context.Context, netInfo *network.Info) Presen
 		e.recordEvent("offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 		e.emitEvent("device_offline", d)
 		e.emitEvent("device_updated", d)
-		e.fireAlert("device_offline", d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
+		e.fireAlert(AlertRuleDeviceOffline, d.ID, fmt.Sprintf("%s went offline", d.DisplayName()))
 	}
 	for i := range changed {
 		d := changed[i]
@@ -309,6 +476,14 @@ func (e *Engine) finishStartupPresence() {
 }
 
 func (e *Engine) readARP(ctx context.Context) []scanner.RawDevice {
+	return e.readARPWithTTL(ctx, arpCacheTTL)
+}
+
+func (e *Engine) readARPFresh(ctx context.Context) []scanner.RawDevice {
+	return e.readARPWithTTL(ctx, 0)
+}
+
+func (e *Engine) readARPWithTTL(ctx context.Context, ttl time.Duration) []scanner.RawDevice {
 	if e.arpFn != nil {
 		devs, err := e.arpFn(ctx)
 		if err != nil {
@@ -319,11 +494,28 @@ func (e *Engine) readARP(ctx context.Context) []scanner.RawDevice {
 	if e.netScanner == nil {
 		return nil
 	}
-	devs, err := e.netScanner.ARPTableNumeric(ctx, arpCacheTTL)
+	devs, err := e.netScanner.ARPTableNumeric(ctx, ttl)
 	if err != nil {
 		return nil
 	}
 	return devs
+}
+
+// probeIPVerify is the patient probe used on verification passes.
+func (e *Engine) probeIPVerify(ctx context.Context, ip string) (float64, bool) {
+	if e.verifyFn != nil {
+		return e.verifyFn(ctx, ip)
+	}
+	if e.probeFn != nil {
+		return e.probeFn(ctx, ip)
+	}
+	return scanner.ProbeIPVerify(ctx, ip)
+}
+
+// nextPresencePass returns a monotonically increasing pass counter, used to
+// space verification passes out across presence ticks.
+func (e *Engine) nextPresencePass() uint64 {
+	return e.presencePass.Add(1)
 }
 
 func (e *Engine) probeIPQuick(ctx context.Context, ip string) (float64, bool) {

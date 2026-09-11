@@ -7,11 +7,24 @@ import (
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
+	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
-func TestPresenceMarksOfflineAfterDebouncedMisses(t *testing.T) {
+func newTestEngineWithNet() *Engine {
 	eng := New(nil)
+	eng.notifyFn = func(string, string) error { return nil }
+	home := netInfoFor("192.168.0.0/24", "192.168.0.1")
+	eng.SetActiveNetwork(&home)
+	eng.netDetectFn = func() (*network.Info, error) {
+		cp := home
+		return &cp, nil
+	}
+	return eng
+}
+
+func TestPresenceMarksOfflineAfterDebouncedMisses(t *testing.T) {
+	eng := newTestEngineWithNet()
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:50", LatencyMs: 1}, mdns.DeviceDetails{
 		Hostname: "cam",
 	}, "Unknown", time.Now(), nil)
@@ -44,7 +57,7 @@ func TestPresenceMarksOfflineAfterDebouncedMisses(t *testing.T) {
 }
 
 func TestPresenceBringsDeviceOnline(t *testing.T) {
-	eng := New(nil)
+	eng := newTestEngineWithNet()
 	id := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:51", LatencyMs: 1}, mdns.DeviceDetails{
 		Hostname: "cam",
 	}, "Unknown", time.Now(), nil)
@@ -74,7 +87,7 @@ func TestPresenceBringsDeviceOnline(t *testing.T) {
 // exactly the bug this split exists to fix: a sweep took ~20s of every 30s, so
 // online/offline detection was dead most of the time.
 func TestPresenceRunsDuringDiscovery(t *testing.T) {
-	eng := New(nil)
+	eng := newTestEngineWithNet()
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "AA:BB:CC:DD:EE:52"}, mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
 	var called atomic.Bool
 	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }
@@ -99,7 +112,7 @@ func TestPresenceRunsDuringDiscovery(t *testing.T) {
 }
 
 func TestPresenceGateIsSingleFlight(t *testing.T) {
-	eng := New(nil)
+	eng := newTestEngineWithNet()
 	eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.60", MAC: "AA:BB:CC:DD:EE:60"}, mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
 	var probes atomic.Int32
 	eng.arpFn = func(ctx context.Context) ([]scanner.RawDevice, error) { return nil, nil }

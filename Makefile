@@ -9,7 +9,9 @@ build:
 		echo "Compiling notification helper..."; \
 		clang -O2 -framework Cocoa -Wno-deprecated-declarations scripts/notify.m -o build/gofing-notify; \
 	fi
-	CGO_ENABLED=1 go build -o gofing .
+	@eval $$(./scripts/version.sh --env) && \
+	echo "Building Gofing v$$VERSION ($$BUILD_TIME)..." && \
+	CGO_ENABLED=1 go build -ldflags "-X 'github.com/jaredwarren/Gofing/pkg/version.Version=$$VERSION' -X 'github.com/jaredwarren/Gofing/pkg/version.BuildTime=$$BUILD_TIME'" -o gofing .
 
 run: build
 	./gofing -port $(PORT)
@@ -38,3 +40,4 @@ clean:
 	rm -f gofing
 	rm -rf Gofing.app
 	rm -f build/gofing-notify
+	rm -f build/.last_build_hash

@@ -248,6 +248,20 @@ func (s *Store) GetSettings() (Settings, error) {
 		if _, ok := raw["notify_macos"]; !ok {
 			loaded.NotifymacOS = defaults.NotifymacOS
 		}
+		if _, ok := raw["remote_oui_lookup"]; !ok {
+			loaded.RemoteOUILookup = defaults.RemoteOUILookup
+		}
+		if _, ok := raw["alert_online"]; !ok {
+			loaded.AlertOnline = defaults.AlertOnline
+		}
+		if _, ok := raw["alert_offline"]; !ok {
+			loaded.AlertOffline = defaults.AlertOffline
+		}
+		// Absent means "never configured": adopt the default damping rather
+		// than leaving a pre-existing install with none.
+		if _, ok := raw["alert_cooldown_sec"]; !ok {
+			loaded.AlertCooldownSec = defaults.AlertCooldownSec
+		}
 	}
 	return loaded, nil
 }

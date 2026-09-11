@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,11 +21,15 @@ import (
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/server"
 	"github.com/jaredwarren/Gofing/pkg/store"
+	"github.com/jaredwarren/Gofing/pkg/version"
 	"github.com/jaredwarren/Gofing/web"
 )
 
 func main() {
+	versionFlag := flag.Bool("version", false, "Print version and build time and exit")
+	vFlag := flag.Bool("v", false, "Print version and build time and exit (shorthand)")
 	portFlag := flag.Int("port", 8080, "Port for the web interface")
+	listenFlag := flag.String("listen", "127.0.0.1", "Bind address (default loopback; use 0.0.0.0 to expose on the LAN — there is no authentication)")
 	intervalFlag := flag.Duration("interval", 5*time.Minute, "Deprecated: seeds the Tier-2 discovery sweep interval; prefer PATCH /api/settings")
 	openFlag := flag.Bool("open", true, "Open a desktop GUI window on startup")
 	dataDirFlag := flag.String("data-dir", "", "Data directory (default: ~/Library/Application Support/Gofing)")
@@ -33,14 +38,26 @@ func main() {
 	dhcpIntervalFlag := flag.Duration("dhcp-interval", 60*time.Second, "DHCP lease poll interval")
 	flag.Parse()
 
+	if *versionFlag || *vFlag {
+		fmt.Printf("Gofing %s\n", version.String())
+		return
+	}
+
 	setupLogging(*openFlag)
 	if os.Getenv("GOFING_DEBUG") != "" {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr,
 			&slog.HandlerOptions{Level: slog.LevelDebug})))
 	}
 
+	listenHost := strings.TrimSpace(*listenFlag)
+	if listenHost == "" {
+		listenHost = "127.0.0.1"
+	}
 	url := fmt.Sprintf("http://127.0.0.1:%d", *portFlag)
-	slog.Info("⚡ Starting Gofing Local Network Discovery Service...")
+	slog.Info("⚡ Starting Gofing Local Network Discovery Service...",
+		"version", version.Version,
+		"build_time", version.BuildTime,
+	)
 
 	// Second Dock click while already running: reopen the UI instead of dying on the DB lock.
 	if *openFlag && httpReachable(url) {
@@ -116,7 +133,11 @@ func main() {
 	}
 
 	httpServer := server.New(devEngine, staticFS)
-	addr := fmt.Sprintf(":%d", *portFlag)
+	addr := net.JoinHostPort(listenHost, fmt.Sprintf("%d", *portFlag))
+	if listenHost != "127.0.0.1" && listenHost != "localhost" && listenHost != "::1" {
+		slog.Warn("binding off loopback with no authentication — LAN peers can read inventory and trigger scans",
+			"listen", addr)
+	}
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -128,7 +149,12 @@ func main() {
 		fail("Failed to listen on "+addr, err, *openFlag)
 	}
 
-	srv := &http.Server{Handler: httpServer.Handler()}
+	srv := &http.Server{
+		Handler: httpServer.Handler(),
+		// Bound header reads; do not set WriteTimeout — SSE (/api/events) is long-lived.
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	go func() {
 		slog.Info("🚀 Gofing Web Interface running", "url", url)

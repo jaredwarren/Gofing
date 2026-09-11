@@ -3,11 +3,13 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/network"
 	"github.com/jaredwarren/Gofing/pkg/oui"
+	"github.com/jaredwarren/Gofing/pkg/probes"
 	"github.com/jaredwarren/Gofing/pkg/scanner"
 )
 
@@ -53,8 +55,13 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 	e.mu.Lock()
 	prevKey := e.activeNetworkKey
 	e.setActiveNetworkLocked(netInfo)
+	migrated, deleted := e.reconcileScopedIDsLocked()
 	netChanged := prevKey != "" && prevKey != e.activeNetworkKey
 	e.mu.Unlock()
+	for _, id := range deleted {
+		e.deletePersisted(id)
+	}
+	e.persistDevices(migrated)
 	if netChanged {
 		e.emitEvent("network_changed", map[string]interface{}{
 			"network_key": NetworkKeyFromInfo(netInfo),
@@ -64,6 +71,13 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 		})
 	}
 	e.listenMDNS(netInfo.InterfaceName)
+
+	// Ask the network to identify itself before sweeping. Both are fire-and-
+	// forget: the mDNS answers land in the listener's cache and are collected
+	// by applyCachedHostnames at the end of this pass, and the SSDP responders
+	// feed the enrichment queue. Neither blocks the sweep.
+	e.browseServices(ctx, netInfo.InterfaceName)
+	go e.discoverSSDP(ctx, netInfo.IP)
 
 	// Reuse Tier 1's most recent confirmations as the sweep's skip list. When
 	// presence has not run yet — a cold start, or a just-changed network — fall
@@ -119,6 +133,13 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 			if h := mdns.SanitizeHostname(raw.Hostname); h != "" {
 				name, src = mdns.PreferHostname(name, src, h, mdns.NameSourceARP)
 			}
+			if (name == "" || isGenericHostname(name)) && e.netScanner != nil {
+				if arpH := e.netScanner.ARPHostname(raw.IP); arpH != "" {
+					if h := mdns.SanitizeHostname(arpH); h != "" {
+						name, src = mdns.PreferHostname(name, src, h, mdns.NameSourceARP)
+					}
+				}
+			}
 			isHost := raw.IP == netInfo.IP ||
 				(raw.MAC != "" && netInfo.MAC != "" && NormalizeMAC(raw.MAC) == NormalizeMAC(netInfo.MAC))
 			if isHost && netInfo.ComputerName != "" {
@@ -128,7 +149,13 @@ func (e *Engine) DiscoverOnce(ctx context.Context, netInfo *network.Info) (Disco
 		}
 
 		id := e.upsertDeviceOpts(raw, details, vendor, now, wasOnline,
-			upsertOpts{Persist: false, EmitFound: true, EmitUpdate: true})
+			upsertOpts{
+				Persist: false, EmitFound: true, EmitUpdate: true,
+				// The sweep already requires an ARP entry, so this is belt and
+				// braces — but it is the invariant that keeps a probe artifact
+				// from ever becoming a permanent inventory row.
+				RequireMACForNew: true,
+			})
 		if id == "" {
 			continue
 		}
@@ -193,6 +220,48 @@ func (e *Engine) sweepSubnet(ctx context.Context, subnetCIDR, iface string,
 	return e.netScanner.PerformScan(ctx, subnetCIDR, iface, skipHits, progress)
 }
 
+// browseServices actively asks which hosts offer well-known services. The
+// always-on listener only hears a device that chooses to announce itself, which
+// an idle already-associated device may never do.
+func (e *Engine) browseServices(ctx context.Context, iface string) {
+	if e.mdnsResolver == nil || iface == "" {
+		return
+	}
+	if err := e.mdnsResolver.Browse(ctx, iface, nil); err != nil {
+		slog.Debug("mDNS service browse failed", "iface", iface, "error", err)
+	}
+}
+
+// discoverSSDP multicasts one M-SEARCH and queues every responder for
+// enrichment, so a device that answers UPnP but nothing else still gets named.
+func (e *Engine) discoverSSDP(ctx context.Context, hostIP string) {
+	found, err := probes.DiscoverSSDP(ctx, hostIP, 3*time.Second)
+	if err != nil {
+		slog.Debug("SSDP discovery failed", "error", err)
+		return
+	}
+	if len(found) == 0 {
+		return
+	}
+	queued := 0
+	for ip := range found {
+		e.mu.RLock()
+		d := e.findKnownForPresenceLocked(ip, "")
+		var snap Device
+		if d != nil {
+			snap = *d
+		}
+		e.mu.RUnlock()
+		if d == nil {
+			continue // not in inventory; the sweep owns discovery
+		}
+		if ok, _ := e.RequestEnrichment(snap.ID, EnrichReasonUntyped); ok {
+			queued++
+		}
+	}
+	slog.Debug("SSDP discovery complete", "responders", len(found), "queued", queued)
+}
+
 // snapshotSeen copies the devices confirmed by a sweep.
 func (e *Engine) snapshotSeen(seenIDs map[string]bool) []Device {
 	e.mu.RLock()
@@ -209,6 +278,11 @@ func (e *Engine) snapshotSeen(seenIDs map[string]bool) []Device {
 // PerformScan runs one discovery sweep now. Retained for POST /api/scan and for
 // existing callers; the periodic sweep is driven by discoveryLoop.
 func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Device, error) {
+	// Re-verify presence for all known inventory first so reconnected hosts are
+	// marked online immediately before we sweep the subnet.
+	if netInfo != nil {
+		_ = e.PresenceOnce(ctx, netInfo)
+	}
 	res, err := e.DiscoverOnce(ctx, netInfo)
 	if err != nil {
 		return nil, err
@@ -217,22 +291,33 @@ func (e *Engine) PerformScan(ctx context.Context, netInfo *network.Info) ([]Devi
 }
 
 // applyCachedHostnames upgrades in-memory hostnames from the mDNS listener
-// cache. macOS `arp -a` returns "?" for nearly every host, so Bonjour names
-// often arrive only after a device was already swept.
+// cache, macOS ARP table, and matching inventory.
 func (e *Engine) applyCachedHostnames() {
-	if e.mdnsResolver == nil {
-		return
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, d := range e.devices {
 		if d.IP == "" {
 			continue
 		}
-		name, src := e.mdnsResolver.CachedName(d.IP)
-		if name == "" {
-			continue
+		if e.mdnsResolver != nil {
+			if name, src := e.mdnsResolver.CachedName(d.IP); name != "" && !isGenericHostname(name) {
+				d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, name, src)
+			}
 		}
-		d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, name, src)
+		if (d.Hostname == "" || isGenericHostname(d.Hostname)) && e.netScanner != nil {
+			if arpH := e.netScanner.ARPHostname(d.IP); arpH != "" {
+				if h := mdns.SanitizeHostname(arpH); h != "" && !isGenericHostname(h) {
+					d.Hostname, d.NameSource = mdns.PreferHostname(d.Hostname, d.NameSource, h, mdns.NameSourceARP)
+				}
+			}
+		}
+		if d.Hostname == "" || isGenericHostname(d.Hostname) {
+			e.adoptDeviceMetadataLocked(d)
+			if d.Hostname == "" {
+				if bestName, bestSrc := e.findBestNameLocked(d); bestName != "" {
+					d.Hostname, d.NameSource = bestName, bestSrc
+				}
+			}
+		}
 	}
 }

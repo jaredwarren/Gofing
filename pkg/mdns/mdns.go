@@ -2,6 +2,7 @@ package mdns
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"net"
@@ -331,6 +332,10 @@ func isSaneHostname(name string) bool {
 	if _, blocked := hostnameDenylist[strings.ToLower(name)]; blocked {
 		return false
 	}
+	// NBNS question padding and similar (e.g. AAAAAAAAAAAAAAA) must not stick as hostnames.
+	if isMonotoneASCII(name) {
+		return false
+	}
 
 	lettersOrDigits := 0
 	for _, r := range name {
@@ -390,29 +395,149 @@ func queryNetBIOSNameCtx(ctx context.Context, ip string) string {
 	if err != nil || n < 57 {
 		return ""
 	}
+	return parseNetBIOSNodeStatus(buf[:n])
+}
 
-	// NBNS node status replies encode names as 15-byte space-padded ASCII fields.
-	// Scan the payload for the first plausible unique workstation name (suffix 0x00).
-	payload := buf[:n]
-	for i := 0; i+16 <= len(payload); i++ {
-		nameBytes := payload[i : i+15]
-		suffix := payload[i+15]
-		// Common NetBIOS name types: workstation/file server/messenger/domain
-		switch suffix {
-		case 0x00, 0x03, 0x20, 0x1b, 0x1d, 0x1e:
-		default:
-			continue
+// parseNetBIOSNodeStatus extracts a unique workstation/server name from an NBNS
+// NODE STATUS (type 0x21) reply. It walks the DNS-style header/sections so the
+// echoed question name (CK + A-padding for "*") is never mistaken for a hostname.
+func parseNetBIOSNodeStatus(msg []byte) string {
+	if len(msg) < 12 {
+		return ""
+	}
+	qd := int(binary.BigEndian.Uint16(msg[4:6]))
+	an := int(binary.BigEndian.Uint16(msg[6:8]))
+	ns := int(binary.BigEndian.Uint16(msg[8:10]))
+	ar := int(binary.BigEndian.Uint16(msg[10:12]))
+	off := 12
+
+	skipRR := func(count int, withTTL bool) bool {
+		for i := 0; i < count; i++ {
+			_, next, err := readName(msg, off)
+			if err != nil {
+				return false
+			}
+			off = next
+			need := 4 // type + class
+			if withTTL {
+				need += 6 // TTL + rdlength
+			}
+			if off+need > len(msg) {
+				return false
+			}
+			if withTTL {
+				rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+				off += 10
+				if rdlen < 0 || off+rdlen > len(msg) {
+					return false
+				}
+				off += rdlen
+			} else {
+				off += 4
+			}
 		}
-		trimmed := strings.TrimRight(string(nameBytes), " \x00")
-		if sanitized := SanitizeHostname(trimmed); sanitized != "" && isNetBIOSStyleName(sanitized) {
-			return sanitized
+		return true
+	}
+
+	if !skipRR(qd, false) {
+		return ""
+	}
+
+	best := ""
+	bestRank := -1
+	considerRDATA := func(rdata []byte) {
+		if len(rdata) < 1 {
+			return
+		}
+		numNames := int(rdata[0])
+		pos := 1
+		for i := 0; i < numNames; i++ {
+			if pos+18 > len(rdata) {
+				return
+			}
+			nameBytes := rdata[pos : pos+15]
+			suffix := rdata[pos+15]
+			flags := binary.BigEndian.Uint16(rdata[pos+16 : pos+18])
+			pos += 18
+
+			// Group names (WORKGROUP, MSBROWSE, …) are not hostnames.
+			if flags&0x8000 != 0 {
+				continue
+			}
+			rank := netBIOSSuffixRank(suffix)
+			if rank < 0 {
+				continue
+			}
+			trimmed := strings.TrimRight(string(nameBytes), " \x00")
+			sanitized := SanitizeHostname(trimmed)
+			if sanitized == "" || !isNetBIOSStyleName(sanitized) {
+				continue
+			}
+			if rank > bestRank || (rank == bestRank && best == "") {
+				best = sanitized
+				bestRank = rank
+			}
 		}
 	}
-	return ""
+
+	parseAnswers := func(count int) bool {
+		for i := 0; i < count; i++ {
+			_, next, err := readName(msg, off)
+			if err != nil {
+				return false
+			}
+			off = next
+			if off+10 > len(msg) {
+				return false
+			}
+			rrType := binary.BigEndian.Uint16(msg[off : off+2])
+			rdlen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+			off += 10
+			if rdlen < 0 || off+rdlen > len(msg) {
+				return false
+			}
+			rdata := msg[off : off+rdlen]
+			off += rdlen
+			if rrType == 0x0021 { // NBSTAT
+				considerRDATA(rdata)
+			}
+		}
+		return true
+	}
+
+	if !parseAnswers(an) {
+		return ""
+	}
+	// Authority is unused for NBSTAT; skip. Additional sometimes repeats answers.
+	if !skipRR(ns, true) {
+		return best
+	}
+	_ = parseAnswers(ar)
+	return best
+}
+
+func netBIOSSuffixRank(suffix byte) int {
+	// Prefer unique workstation, then file server, then messenger / domain roles.
+	switch suffix {
+	case 0x00:
+		return 4
+	case 0x20:
+		return 3
+	case 0x03:
+		return 2
+	case 0x1b, 0x1d, 0x1e:
+		return 1
+	default:
+		return -1
+	}
 }
 
 func isNetBIOSStyleName(name string) bool {
 	if len(name) == 0 || len(name) > 15 {
+		return false
+	}
+	// Reject question-section padding / monotonous garbage (e.g. AAAAAAAAAAAAAAA).
+	if isMonotoneASCII(name) {
 		return false
 	}
 	for _, r := range name {
@@ -420,6 +545,19 @@ func isNetBIOSStyleName(name string) bool {
 			continue
 		}
 		return false
+	}
+	return true
+}
+
+func isMonotoneASCII(name string) bool {
+	if len(name) < 3 {
+		return false
+	}
+	first := name[0]
+	for i := 1; i < len(name); i++ {
+		if name[i] != first {
+			return false
+		}
 	}
 	return true
 }

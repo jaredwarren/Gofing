@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,14 +69,114 @@ func TestNetworkKeyAndScopedID(t *testing.T) {
 		t.Fatalf("key=%q", key)
 	}
 	key = NetworkKeyFromInfo(&network.Info{SubnetCIDR: "10.0.0.0/24", GatewayIP: "10.0.0.1"})
-	if key != "gw:10.0.0.1@10.0.0.0/24" {
-		t.Fatalf("key=%q", key)
+	if key != "gw:10.0.0.1@10.0.0.0_24" {
+		t.Fatalf("key=%q, want sanitized CIDR (no slash)", key)
+	}
+	if strings.Contains(key, "/") {
+		t.Fatalf("network key must not embed '/': %q", key)
+	}
+	// Wired placeholder must not become an SSID key — it collapses every ethernet LAN.
+	key = NetworkKeyFromInfo(&network.Info{
+		SSID: "Wired / Ethernet", SubnetCIDR: "192.168.0.0/24", GatewayIP: "192.168.0.1",
+	})
+	wantWired := "gw:192.168.0.1@192.168.0.0_24"
+	if key != wantWired {
+		t.Fatalf("wired placeholder key=%q, want %q", key, wantWired)
+	}
+	home := NetworkKeyFromInfo(&network.Info{
+		SSID: "Wired / Ethernet", SubnetCIDR: "192.168.1.0/24", GatewayIP: "192.168.1.1",
+	})
+	office := NetworkKeyFromInfo(&network.Info{
+		SSID: "Wired / Ethernet", SubnetCIDR: "192.168.0.0/24", GatewayIP: "192.168.0.1",
+	})
+	if home == office {
+		t.Fatalf("distinct wired LANs collided on key %q", home)
+	}
+	if got := ScopedDeviceID(wantWired, "aa:bb:cc:dd:ee:ff", ""); got != wantWired+"/AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("scoped=%q", got)
+	} else if strings.Count(got, "/") != 1 {
+		t.Fatalf("scoped id should have exactly one separator slash: %q", got)
 	}
 	if got := ScopedDeviceID("ssid:Home", "aa:bb:cc:dd:ee:ff", ""); got != "ssid:Home/AA:BB:CC:DD:EE:FF" {
 		t.Fatalf("scoped=%q", got)
 	}
 	if got := stripNetworkScope("ssid:Home/AA:BB:CC:DD:EE:FF"); got != "AA:BB:CC:DD:EE:FF" {
 		t.Fatalf("strip=%q", got)
+	}
+	// Legacy slash-in-CIDR and corrupted doubled-prefix IDs must still yield the MAC.
+	if got := stripNetworkScope("gw:192.168.0.1@192.168.0.0/24/AA:BB:CC:DD:EE:FF"); got != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("strip legacy gw=%q", got)
+	}
+	if got := stripNetworkScope("gw:192.168.0.1@192.168.0.0/24/24/AA:BB:CC:DD:EE:FF"); got != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("strip corrupted=%q", got)
+	}
+	if got := stripNetworkScope(wantWired + "/AA:BB:CC:DD:EE:FF"); got != "AA:BB:CC:DD:EE:FF" {
+		t.Fatalf("strip sanitized=%q", got)
+	}
+}
+
+func TestReconcileRepairsWiredPlaceholderAndSlashKeys(t *testing.T) {
+	eng := New(nil)
+	mac := "AA:BB:CC:DD:EE:10"
+	// Persisted under the old wired SSID placeholder — invisible under gw: key without migrate.
+	eng.devices["ssid:Wired / Ethernet/"+mac] = &Device{
+		ID: "ssid:Wired / Ethernet/" + mac, NetworkKey: "ssid:Wired / Ethernet",
+		IP: "192.168.0.10", MAC: mac, IsOnline: false, Hostname: "printer",
+	}
+	// Corrupted ID from first-slash strip on unsanitized CIDR.
+	corruptID := "gw:192.168.0.1@192.168.0.0/24/24/" + mac
+	eng.devices[corruptID] = &Device{
+		ID: corruptID, NetworkKey: "gw:192.168.0.1@192.168.0.0/24",
+		IP: "192.168.0.11", MAC: "AA:BB:CC:DD:EE:11", IsOnline: false,
+	}
+
+	info := &network.Info{SSID: "Wired / Ethernet", SubnetCIDR: "192.168.0.0/24", GatewayIP: "192.168.0.1"}
+	eng.SetActiveNetwork(info)
+
+	wantKey := "gw:192.168.0.1@192.168.0.0_24"
+	devs := eng.GetDevices()
+	if len(devs) != 2 {
+		t.Fatalf("expected 2 visible devices after reconcile, got %d (%+v)", len(devs), devs)
+	}
+	for _, d := range devs {
+		if d.NetworkKey != wantKey {
+			t.Fatalf("device %s NetworkKey=%q, want %q", d.MAC, d.NetworkKey, wantKey)
+		}
+		if !strings.HasPrefix(d.ID, wantKey+"/") {
+			t.Fatalf("device ID %q not under sanitized key", d.ID)
+		}
+		if strings.Contains(strings.TrimPrefix(d.ID, wantKey+"/"), "/") {
+			t.Fatalf("base ID still contains slash: %q", d.ID)
+		}
+	}
+	if _, ok := eng.devices[corruptID]; ok {
+		t.Fatal("corrupted map key should have been removed")
+	}
+}
+
+func TestUpsertRemountDoesNotCorruptGwScopedID(t *testing.T) {
+	eng := New(nil)
+	info := &network.Info{SSID: "Wired / Ethernet", SubnetCIDR: "192.168.0.0/24", GatewayIP: "192.168.0.1"}
+	eng.SetActiveNetwork(info)
+	wantKey := NetworkKeyFromInfo(info)
+
+	id1 := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "aa:bb:cc:dd:ee:50", LatencyMs: 1},
+		mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
+	wantID := wantKey + "/AA:BB:CC:DD:EE:50"
+	if id1 != wantID {
+		t.Fatalf("first upsert id=%q, want %q", id1, wantID)
+	}
+	id2 := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.50", MAC: "aa:bb:cc:dd:ee:50", LatencyMs: 2},
+		mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
+	if id2 != wantID {
+		t.Fatalf("second upsert remounted to %q, want stable %q", id2, wantID)
+	}
+	if len(eng.devices) != 1 {
+		t.Fatalf("devices map grew to %d entries: %#v", len(eng.devices), eng.devices)
+	}
+	dev := eng.devices[wantID]
+	if dev == nil || !dev.IsOnline {
+		t.Fatalf("device should be online after upsert, got %+v", dev)
 	}
 }
 
@@ -268,7 +369,7 @@ func TestScanDevicePortsInvalidMode(t *testing.T) {
 
 func TestResolveDeviceNameMissing(t *testing.T) {
 	eng := New(nil)
-	_, err := eng.ResolveDeviceName("nope")
+	_, err := eng.ResolveDeviceName(context.Background(), "nope")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -277,8 +378,8 @@ func TestResolveDeviceNameMissing(t *testing.T) {
 func TestResolveDeviceNameKeepsExistingWhenMiss(t *testing.T) {
 	eng := New(nil)
 	eng.SetTestHooks(
-		func(string) {},
-		func(*mdns.Resolver, string) mdns.LookupResult { return mdns.LookupResult{} },
+		func(context.Context, string) {},
+		func(context.Context, *mdns.Resolver, string) mdns.LookupResult { return mdns.LookupResult{} },
 	)
 
 	now := time.Now()
@@ -288,12 +389,46 @@ func TestResolveDeviceNameKeepsExistingWhenMiss(t *testing.T) {
 		DeviceType: "Computer",
 	}, "Apple, Inc.", now, nil)
 
-	res, err := eng.ResolveDeviceName("AA:BB:CC:DD:EE:FF")
+	res, err := eng.ResolveDeviceName(context.Background(), "AA:BB:CC:DD:EE:FF")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Device.Hostname != "kept-name" {
 		t.Fatalf("should keep existing hostname, got %q", res.Device.Hostname)
+	}
+}
+
+func TestTryStartPortScanIgnoresCancelledCallerContext(t *testing.T) {
+	eng := New(nil)
+	id := eng.upsertDevice(scanner.RawDevice{IP: "127.0.0.1", MAC: "00:11:22:33:44:88"},
+		mdns.DeviceDetails{}, "Unknown", time.Now(), nil)
+
+	done := make(chan struct{})
+	eng.RegisterEventListener(func(evt string, _ interface{}) {
+		if evt == "portscan_complete" || evt == "portscan_error" {
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulates net/http cancelling r.Context() when the handler returns
+
+	started, err := eng.TryStartPortScan(ctx, id, "common")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("expected scan to start")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("port scan did not finish; cancelled caller context likely aborted it")
 	}
 }
 
@@ -595,5 +730,56 @@ func TestOnNameLearnedAppliesMDNS(t *testing.T) {
 	dev, _ = eng.GetDevice("8C:85:90:24:10:B7")
 	if dev.Hostname != "Amys-MBP" {
 		t.Fatalf("equal-rank flap: %q", dev.Hostname)
+	}
+}
+
+func TestAdoptDeviceMetadataMatchesByIP(t *testing.T) {
+	eng := New(nil)
+	info := &network.Info{GatewayIP: "192.168.0.1", SubnetCIDR: "192.168.0.0/24", SSID: "Home"}
+	eng.SetActiveNetwork(info)
+	now := time.Now()
+
+	// Seed existing offline iPad device on 192.168.0.156
+	id1 := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.156", MAC: "68:2F:67:0E:CD:44"}, mdns.DeviceDetails{
+		Hostname:   "iPad-73",
+		Model:      "iPad",
+		DeviceType: "tablet",
+	}, "Apple, Inc.", now, nil)
+	eng.mu.Lock()
+	eng.devices[id1].IsOnline = false
+	eng.mu.Unlock()
+
+	// New device connects with a private/randomized MAC at the same IP
+	id2 := eng.upsertDevice(scanner.RawDevice{IP: "192.168.0.156", MAC: "AE:35:05:49:5A:0C"}, mdns.DeviceDetails{}, "Private / Randomized MAC", now.Add(time.Second), nil)
+
+	dev2, ok := eng.GetDevice(id2)
+	if !ok {
+		t.Fatal("device 2 not found")
+	}
+	if dev2.Hostname != "iPad-73" {
+		t.Fatalf("expected device to adopt hostname 'iPad-73', got %q", dev2.Hostname)
+	}
+	if dev2.Model != "iPad" {
+		t.Fatalf("expected device to adopt model 'iPad', got %q", dev2.Model)
+	}
+	if dev2.Vendor != "Apple, Inc." {
+		t.Fatalf("expected device to adopt vendor 'Apple, Inc.', got %q", dev2.Vendor)
+	}
+	if dev2.DisplayName() != "iPad-73" {
+		t.Fatalf("expected DisplayName 'iPad-73', got %q", dev2.DisplayName())
+	}
+}
+
+func TestDisplayNameNeverGenericVendor(t *testing.T) {
+	d := Device{
+		IP:     "192.168.0.156",
+		MAC:    "AE:35:05:49:5A:0C",
+		Vendor: "Private / Randomized MAC",
+	}
+	if d.DisplayName() == "Private / Randomized MAC" {
+		t.Fatalf("DisplayName must never return 'Private / Randomized MAC', got %q", d.DisplayName())
+	}
+	if d.DisplayName() != "192.168.0.156" {
+		t.Fatalf("expected fallback to IP '192.168.0.156', got %q", d.DisplayName())
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jaredwarren/Gofing/pkg/mdns"
 	"github.com/jaredwarren/Gofing/pkg/oui"
+	"github.com/jaredwarren/Gofing/pkg/probes"
 )
 
 const (
@@ -35,18 +36,20 @@ type enrichJob struct {
 // served in three bands (manual, then new/woke/unnamed, then stale) so a burst
 // of TTL expiries can never delay the device a user just asked about.
 type enrichQueue struct {
-	mu       sync.Mutex
-	pending  map[string]enrichJob  // DeviceID -> job
-	bands    [enrichBands][]string // FIFO of DeviceIDs per band
-	inflight map[string]bool
-	wake     chan struct{} // cap 1; a lossy nudge, not a handoff
+	mu        sync.Mutex
+	pending   map[string]enrichJob  // DeviceID -> job
+	bands     [enrichBands][]string // FIFO of DeviceIDs per band
+	inflight  map[string]bool
+	rekeyedTo map[string]string // popped ID -> current inflight ID after remount
+	wake      chan struct{}     // cap 1; a lossy nudge, not a handoff
 }
 
 func newEnrichQueue() *enrichQueue {
 	return &enrichQueue{
-		pending:  make(map[string]enrichJob),
-		inflight: make(map[string]bool),
-		wake:     make(chan struct{}, 1),
+		pending:   make(map[string]enrichJob),
+		inflight:  make(map[string]bool),
+		rekeyedTo: make(map[string]string),
+		wake:      make(chan struct{}, 1),
 	}
 }
 
@@ -139,15 +142,23 @@ func (q *enrichQueue) pop() (enrichJob, bool) {
 	return enrichJob{}, false
 }
 
-// done clears the in-flight marker for a device.
+// done clears the in-flight marker for the ID the worker popped. If the device
+// was remounted while the job ran, rekey moved the marker — follow that chain
+// so the destination does not stay stuck-inflight forever.
 func (q *enrichQueue) done(id string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	delete(q.inflight, id)
+	for id != "" {
+		delete(q.inflight, id)
+		next := q.rekeyedTo[id]
+		delete(q.rekeyedTo, id)
+		id = next
+	}
 }
 
 // rekey follows a device through the ID migration in upsertDevice, so a queued
-// job is not orphaned when a device is remounted under a new scoped ID.
+// or in-flight job is not orphaned when a device is remounted under a new
+// scoped ID.
 func (q *enrichQueue) rekey(oldID, newID string) {
 	if oldID == "" || newID == "" || oldID == newID {
 		return
@@ -158,6 +169,8 @@ func (q *enrichQueue) rekey(oldID, newID string) {
 	if q.inflight[oldID] {
 		delete(q.inflight, oldID)
 		q.inflight[newID] = true
+		// Worker will still call done(oldID); chain so that clears newID too.
+		q.rekeyedTo[oldID] = newID
 	}
 	job, ok := q.pending[oldID]
 	if !ok {
@@ -167,8 +180,15 @@ func (q *enrichQueue) rekey(oldID, newID string) {
 	q.removeFromBandLocked(band, oldID)
 	delete(q.pending, oldID)
 
-	if _, clash := q.pending[newID]; clash {
-		return // the destination already has work queued
+	if existing, clash := q.pending[newID]; clash {
+		// Keep the more urgent reason rather than silently dropping work.
+		if job.Reason.priority() < existing.Reason.priority() {
+			q.removeFromBandLocked(existing.Reason.priority(), newID)
+			job.DeviceID = newID
+			q.pending[newID] = job
+			q.bands[band] = append(q.bands[band], newID)
+		}
+		return
 	}
 	job.DeviceID = newID
 	q.pending[newID] = job
@@ -246,13 +266,24 @@ func (e *Engine) resolveDetails(ctx context.Context, in mdns.ResolveInput) mdns.
 }
 
 // lookupVendor resolves a MAC vendor, through the test seam when set. This is
-// the only path allowed to fall back to the maclookup.app HTTP request.
+// the only path allowed to fall back to the maclookup.app HTTP request, and
+// only when Settings.RemoteOUILookup is enabled. The API is always queried with
+// the OUI prefix alone (never a full MAC).
 func (e *Engine) lookupVendor(mac string) string {
 	e.mu.RLock()
 	fn := e.vendorFn
 	e.mu.RUnlock()
 	if fn != nil {
 		return fn(mac)
+	}
+	e.settingsMu.RLock()
+	remote := e.settings.RemoteOUILookup
+	e.settingsMu.RUnlock()
+	if !remote {
+		if local := oui.LookupVendorLocal(mac); local != "" {
+			return local
+		}
+		return "Generic Device"
 	}
 	return oui.LookupVendor(mac)
 }
@@ -293,18 +324,18 @@ func (e *Engine) enrichOnce(ctx context.Context, job enrichJob) (changed bool, e
 	jctx, cancel := context.WithTimeout(ctx, enrichJobBudget)
 	defer cancel()
 
-	netKey, gatewayIP, hostIP, hostMAC, hostName := e.netIdentity()
+	gatewayIP, hostIP, hostMAC, hostName := e.netIdentity()
 	isGateway := dev.IP != "" && dev.IP == gatewayIP
 	isHost := (hostIP != "" && dev.IP == hostIP) ||
 		(hostMAC != "" && dev.MAC != "" && NormalizeMAC(dev.MAC) == NormalizeMAC(hostMAC))
-	_ = netKey
 
 	var (
-		wg      sync.WaitGroup
-		vendor  string
-		details mdns.DeviceDetails
+		wg          sync.WaitGroup
+		vendor      string
+		details     mdns.DeviceDetails
+		probeResult probes.ProbeResult
 	)
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		vendor = e.lookupVendor(dev.MAC)
@@ -323,19 +354,44 @@ func (e *Engine) enrichOnce(ctx context.Context, job enrichJob) (changed bool, e
 		}
 		details = e.resolveDetails(jctx, in)
 	}()
+	go func() {
+		defer wg.Done()
+		var openPorts []int
+		for _, sp := range dev.OpenPorts {
+			openPorts = append(openPorts, sp.Port)
+		}
+		probeResult = e.probeDevice(jctx, dev.IP, openPorts)
+	}()
 	wg.Wait()
 
 	now := time.Now()
 	e.mu.Lock()
 	d, ok := e.devices[job.DeviceID]
 	if !ok {
+		// Remounted under a new ID while the probes ran (ip:→MAC, network scope).
+		if found := e.findKnownForPresenceLocked(job.IP, job.MAC); found != nil {
+			d, ok = found, true
+			job.DeviceID = found.ID
+		}
+	}
+	if !ok {
 		e.mu.Unlock()
 		return false, fmt.Errorf("device disappeared during enrichment")
 	}
 	before := *d
 	changed = applyDetailsLocked(d, details, vendor)
+	if applyProbeResultLocked(d, probeResult) {
+		changed = true
+	}
 	d.LastEnrichedAt = now
-	d.EnrichFailures = 0
+	// A completed probe that taught us nothing must still engage the failure
+	// backoff — otherwise unnameable devices are re-probed forever at the
+	// unnamed TTL. Reset the counter only when identity fields actually moved.
+	if changed {
+		d.EnrichFailures = 0
+	} else {
+		d.EnrichFailures++
+	}
 	out := *d
 	e.mu.Unlock()
 
@@ -368,17 +424,16 @@ func (e *Engine) markEnriched(id string, at time.Time, success bool) {
 }
 
 // netIdentity snapshots the fields of the active network that fingerprinting needs.
-func (e *Engine) netIdentity() (netKey, gatewayIP, hostIP, hostMAC, hostName string) {
+func (e *Engine) netIdentity() (gatewayIP, hostIP, hostMAC, hostName string) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	netKey = e.activeNetworkKey
 	if e.netInfo != nil {
 		gatewayIP = e.netInfo.GatewayIP
 		hostIP = e.netInfo.IP
 		hostMAC = e.netInfo.MAC
 		hostName = e.netInfo.ComputerName
 	}
-	return netKey, gatewayIP, hostIP, hostMAC, hostName
+	return gatewayIP, hostIP, hostMAC, hostName
 }
 
 // RequestEnrichment queues a fingerprint refresh for a device. queued=false
@@ -430,16 +485,4 @@ func (e *Engine) enqueueWoke(d Device) bool {
 		Reason:   EnrichReasonWoke,
 		Queued:   time.Now(),
 	})
-}
-
-// EnrichStats reports Tier-3 queue depth.
-type EnrichStats struct {
-	Pending  int `json:"enrich_pending"`
-	Inflight int `json:"enrich_inflight"`
-}
-
-// EnrichmentStats returns the current queue depth.
-func (e *Engine) EnrichmentStats() EnrichStats {
-	pending, inflight := e.enrichQ.stats()
-	return EnrichStats{Pending: pending, Inflight: inflight}
 }

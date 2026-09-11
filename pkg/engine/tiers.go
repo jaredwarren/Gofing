@@ -19,8 +19,17 @@ package engine
 //     Never the reverse.
 //
 // Ownership is partitioned so the tiers need no coordination beyond those
-// rules: Tier 1 alone writes IsOnline and missCount, Tier 2 alone sweeps for
-// new hosts, and Tier 3 alone writes identity fields.
+// rules:
+//
+//   - Presence (IsOnline / missCount): any tier may prove a device *present*
+//     (a sweep hit or ARP confirmation is positive evidence). Only Tier 1 may
+//     declare a device *absent*, and only after offlineMissThreshold consecutive
+//     misses. All IsOnline writes go through setOnlineLocked.
+//   - Discovery alone sweeps for new hosts.
+//   - Enrichment alone writes identity fields (hostname, vendor, type, …).
+//
+// IsOnline writes are funneled through setOnlineLocked so the asymmetric rule
+// stays greppable.
 
 import (
 	"context"
@@ -151,7 +160,9 @@ const discoveryPassBudget = 4 * time.Minute
 //
 // The detection shells out to route/networksetup/ipconfig, so the presence tier
 // must not do it on every tick — but it does need to notice a Wi-Fi change well
-// before the next five-minute sweep.
+// before the next five-minute sweep. When the refreshed info implies a different
+// NetworkKey, this also updates activeNetworkKey (and emits network_changed) so
+// deviceVisibleLocked and ARP/subnet filtering stay on the same LAN.
 func (e *Engine) currentNetInfo(maxAge time.Duration) *network.Info {
 	if maxAge > 0 {
 		e.mu.RLock()
@@ -162,7 +173,7 @@ func (e *Engine) currentNetInfo(maxAge time.Duration) *network.Info {
 		}
 	}
 
-	info, err := network.GetActiveNetworkInfo()
+	info, err := e.detectActiveNetwork()
 	if err != nil || info == nil {
 		// Fall back to whatever we last knew rather than reporting no network.
 		e.mu.RLock()
@@ -175,10 +186,39 @@ func (e *Engine) currentNetInfo(maxAge time.Duration) *network.Info {
 	}
 
 	e.mu.Lock()
-	e.netInfo = info
-	e.netInfoAt = time.Now()
+	prevKey := e.activeNetworkKey
+	e.setActiveNetworkLocked(info)
+	keyChanged := prevKey != e.activeNetworkKey
+	var migrated []Device
+	var deleted []string
+	if keyChanged {
+		migrated, deleted = e.reconcileScopedIDsLocked()
+	}
+	out := e.netInfo
 	e.mu.Unlock()
-	return info
+
+	if keyChanged {
+		for _, id := range deleted {
+			e.deletePersisted(id)
+		}
+		e.persistDevices(migrated)
+		if prevKey != "" {
+			e.emitEvent("network_changed", map[string]interface{}{
+				"network_key": NetworkKeyFromInfo(info),
+				"ssid":        info.SSID,
+				"subnet":      info.SubnetCIDR,
+				"devices":     e.GetDevices(),
+			})
+		}
+	}
+	return out
+}
+
+func (e *Engine) detectActiveNetwork() (*network.Info, error) {
+	if e.netDetectFn != nil {
+		return e.netDetectFn()
+	}
+	return network.GetActiveNetworkInfo()
 }
 
 // TierStatus is the observable state of the three tiers, surfaced on

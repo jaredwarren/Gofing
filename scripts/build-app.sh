@@ -39,6 +39,8 @@ if [ -f "$DIR/build/Gofing.png" ]; then
   cp "$DIR/build/Gofing.png" "$RESOURCES_DIR/Gofing.png"
 fi
 
+APP_VERSION=$(tr -d ' \t\r\n' < "$DIR/VERSION" 2>/dev/null || echo "1.0.0")
+
 cat > "$CONTENTS/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,9 +55,9 @@ cat > "$CONTENTS/Info.plist" << EOF
     <key>CFBundleIdentifier</key>
     <string>com.jaredwarren.gofing</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleExecutable</key>
     <string>Gofing</string>
 ${ICON_KEYS}

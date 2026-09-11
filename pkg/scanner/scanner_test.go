@@ -130,10 +130,52 @@ func TestParseARPLineWithHostname(t *testing.T) {
 	}
 }
 
-func TestMergeProbeAndARPIncludesPingWithoutARP(t *testing.T) {
+// TestMergeProbeAndARPDropsPingWithoutARP pins a deliberate behavior change.
+//
+// This previously returned the address as a MAC-less host. Under the sweep's
+// 48-way concurrency macOS reports sub-millisecond TCP connects for addresses
+// that are unreachable to any serial probe and `(incomplete)` in the ARP
+// table, so that rule invented a phantom device per false positive — 44 of
+// them accumulated in one real inventory inside two days — and briefly marked
+// genuinely absent devices online. A host on a directly-connected subnet
+// cannot pass IP traffic without a resolved ARP entry, so the entry is the
+// evidence and the probe reply alone is not.
+func TestMergeProbeAndARPDropsPingWithoutARP(t *testing.T) {
 	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, map[string]RawDevice{}, "10.0.0.0/24", "en0", time.Now())
-	if len(got) != 1 || got[0].MAC != "" || !got[0].IsOnline {
-		t.Fatalf("unexpected result: %+v", got)
+	if len(got) != 0 {
+		t.Fatalf("probe reply with no ARP entry must be discarded, got %+v", got)
+	}
+}
+
+func TestMergeProbeAndARPKeepsPingWithARP(t *testing.T) {
+	arp := map[string]RawDevice{
+		"10.0.0.5": {IP: "10.0.0.5", MAC: "AA:BB:CC:DD:EE:05", Iface: "en0", Hostname: "pi"},
+	}
+	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, arp, "10.0.0.0/24", "en0", time.Now())
+	if len(got) != 1 {
+		t.Fatalf("expected the ARP-backed host, got %+v", got)
+	}
+	if got[0].MAC != "AA:BB:CC:DD:EE:05" {
+		t.Errorf("MAC = %q, want it carried over from ARP", got[0].MAC)
+	}
+	if got[0].LatencyMs != 3.0 {
+		t.Errorf("LatencyMs = %v, want the measured 3.0 preserved", got[0].LatencyMs)
+	}
+	if got[0].Hostname != "pi" {
+		t.Errorf("Hostname = %q, want it carried over from ARP", got[0].Hostname)
+	}
+	if !got[0].IsOnline {
+		t.Error("IsOnline should be true")
+	}
+}
+
+func TestMergeProbeAndARPRejectsOtherInterface(t *testing.T) {
+	arp := map[string]RawDevice{
+		"10.0.0.5": {IP: "10.0.0.5", MAC: "AA:BB:CC:DD:EE:05", Iface: "en1"},
+	}
+	got := mergeProbeAndARP(map[string]float64{"10.0.0.5": 3.0}, arp, "10.0.0.0/24", "en0", time.Now())
+	if len(got) != 0 {
+		t.Fatalf("ARP evidence from another interface must not count, got %+v", got)
 	}
 }
 
@@ -254,5 +296,62 @@ func TestARPTableNumericAndNamedCacheSeparately(t *testing.T) {
 	_, _ = s.ARPTableCached(context.Background(), time.Minute)
 	if numericCalls != 1 || namedCalls != 1 {
 		t.Fatalf("numeric=%d named=%d; want both still cached", numericCalls, namedCalls)
+	}
+}
+
+func TestParseARPReachabilityInformation(t *testing.T) {
+	// Sample output from `arp -n -l -a` containing:
+	// - router (reachable)
+	// - iPad (reachable, countdown timer)
+	// - disconnected Watch (incomplete)
+	// - disconnected GamingLaptop (expired exp_o & exp_i, prbs=36)
+	// - failed probe host (exp_i=expired, prbs=12)
+	// - multicast entry (should be skipped)
+	sample := `
+Neighbor                Linklayer Address Expire(O) Expire(I)          Netif Refs Prbs
+192.168.0.1             54:af:97:14:cf:7c 2m38s     2m30s          en0    1
+192.168.0.4             (incomplete)      1m16s     expired        en0    2   35
+192.168.0.156           ae:35:5:49:5a:c   1m3s      41s            en0    1
+169.254.33.142          f4:28:9d:d0:33:d7 expired   expired        en0    2   36
+192.168.0.77            aa:bb:cc:dd:ee:77 1m20s     expired        en0    1   12
+224.0.0.251             1:0:5e:0:0:fb     (none)    (none)         en0
+`
+	devs := parseARPTableOutput(sample, time.Now())
+	if len(devs) != 2 {
+		t.Fatalf("expected 2 reachable devices, got %d: %+v", len(devs), devs)
+	}
+	byIP := make(map[string]RawDevice)
+	for _, d := range devs {
+		byIP[d.IP] = d
+	}
+	if d, ok := byIP["192.168.0.1"]; !ok || d.MAC != "54:AF:97:14:CF:7C" {
+		t.Errorf("router missing or incorrect: %+v", d)
+	}
+	if d, ok := byIP["192.168.0.156"]; !ok || d.MAC != "AE:35:05:49:5A:0C" {
+		t.Errorf("iPad missing or incorrect: %+v", d)
+	}
+	if _, ok := byIP["192.168.0.4"]; ok {
+		t.Errorf("incomplete device should be excluded")
+	}
+	if _, ok := byIP["169.254.33.142"]; ok {
+		t.Errorf("double-expired device should be excluded")
+	}
+	if _, ok := byIP["192.168.0.77"]; ok {
+		t.Errorf("device with failed probes should be excluded")
+	}
+	if _, ok := byIP["224.0.0.251"]; ok {
+		t.Errorf("multicast entry should be excluded")
+	}
+}
+
+func TestIsTCPRefused(t *testing.T) {
+	if isTCPRefused(nil) {
+		t.Error("nil error should not be refused")
+	}
+	if !isTCPRefused(errors.New("dial tcp 192.168.0.1:80: connect: connection refused")) {
+		t.Error("connection refused string should be detected")
+	}
+	if isTCPRefused(errors.New("i/o timeout")) {
+		t.Error("timeout should not be detected as refused")
 	}
 }

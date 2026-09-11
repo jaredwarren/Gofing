@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -101,5 +102,47 @@ func TestDevicesRootReportsTierStatus(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("response missing %s: %s", want, body)
 		}
+	}
+}
+
+func TestScanRejectsGET(t *testing.T) {
+	_, h := scopedIDEngine(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/scan", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /api/scan = %d, want 405 (CSRF one-click surface)", rec.Code)
+	}
+}
+
+func TestSSEOmitsWildcardCORS(t *testing.T) {
+	_, h := scopedIDEngine(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	// Give the handler time to write the init frame and headers.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(rec.Body.String(), "event: init") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty (same-origin only)", got)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q", ct)
 	}
 }

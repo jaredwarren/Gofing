@@ -50,7 +50,8 @@ func (d Device) DisplayName() string {
 func isGenericLabel(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "apple device", "generic device", "network device", "standard network hardware",
-		"unknown vendor", "generic", "device":
+		"unknown vendor", "generic", "device", "unknown", "unknown device",
+		"private / randomized mac", "private mac", "randomized mac", "private / randomized mac address":
 		return true
 	default:
 		return false

@@ -25,6 +25,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const activityFeed = document.getElementById('activityFeed');
   const alertsEnabledChk = document.getElementById('alertsEnabledChk');
   const notifyMacosChk = document.getElementById('notifyMacosChk');
+  const alertOnlineChk = document.getElementById('alertOnlineChk');
+  const alertOfflineChk = document.getElementById('alertOfflineChk');
+  const alertCooldownSel = document.getElementById('alertCooldownSel');
+  const versionBadgeEl = document.getElementById('versionBadge');
 
   const deviceDrawer = document.getElementById('deviceDrawer');
   const drawerCloseBtn = document.getElementById('drawerCloseBtn');
@@ -47,7 +51,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const saveStatus = document.getElementById('saveStatus');
   const historyList = document.getElementById('historyList');
   const drawerTabs = document.getElementById('drawerTabs');
+  const btnDeepProbe = document.getElementById('btnDeepProbe');
+  const toolProbeStatus = document.getElementById('toolProbeStatus');
+  const toolProbeCard = document.getElementById('toolProbeCard');
   const btnResolveName = document.getElementById('btnResolveName');
+  const btnRecheck = document.getElementById('btnRecheck');
+  const toolRecheckStatus = document.getElementById('toolRecheckStatus');
+  const toolRecheckOutput = document.getElementById('toolRecheckOutput');
   const toolResolveStatus = document.getElementById('toolResolveStatus');
   const toolResolveOutput = document.getElementById('toolResolveOutput');
   const btnScanPorts = document.getElementById('btnScanPorts');
@@ -82,16 +92,35 @@ document.addEventListener('DOMContentLoaded', () => {
     }).catch(err => console.error('Clipboard copy error:', err));
   }
 
+  fetchVersionInfo();
   fetchNetworkInfo();
   fetchInitialDevices();
   fetchActivity();
   fetchSettings();
   initSSE();
 
+  const searchClearBtn = document.getElementById('searchClearBtn');
+
+  function syncSearchClear() {
+    if (!searchClearBtn) return;
+    searchClearBtn.hidden = !searchInput.value;
+  }
+
   searchInput.addEventListener('input', (e) => {
     searchQuery = e.target.value.toLowerCase().trim();
+    syncSearchClear();
     renderTable();
   });
+
+  if (searchClearBtn) {
+    searchClearBtn.addEventListener('click', () => {
+      searchInput.value = '';
+      searchQuery = '';
+      syncSearchClear();
+      searchInput.focus();
+      renderTable();
+    });
+  }
 
   categoryPillsContainer.addEventListener('click', (e) => {
     const pill = e.target.closest('.pill');
@@ -102,6 +131,34 @@ document.addEventListener('DOMContentLoaded', () => {
       renderTable();
     }
   });
+
+  const activityFilterPills = document.getElementById('activityFilterPills');
+  if (activityFilterPills) {
+    activityFilterPills.addEventListener('click', (e) => {
+      const pill = e.target.closest('.act-pill');
+      if (!pill) return;
+      const filter = pill.dataset.actFilter;
+      if (!filter || filter === currentActivityFilter) return;
+
+      activityFilterPills.querySelectorAll('.act-pill').forEach(p => p.classList.remove('active'));
+      pill.classList.add('active');
+      currentActivityFilter = filter;
+      renderFilteredActivity();
+    });
+  }
+
+  if (activityFeed) {
+    activityFeed.addEventListener('click', (e) => {
+      const item = e.target.closest('.activity-item.is-clickable');
+      if (!item) return;
+      const devId = item.dataset.deviceId;
+      if (!devId) return;
+      const dev = findDevice(devId);
+      if (dev) {
+        openDrawer(dev.id, 'overview');
+      }
+    });
+  }
 
   rescanBtn.addEventListener('click', () => triggerScan());
   dhcpImportBtn.addEventListener('click', () => dhcpFileInput.click());
@@ -143,7 +200,9 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   saveDeviceBtn.addEventListener('click', saveDeviceEdits);
+  if (btnDeepProbe) btnDeepProbe.addEventListener('click', runDeepProbe);
   btnResolveName.addEventListener('click', resolveDeviceName);
+  if (btnRecheck) btnRecheck.addEventListener('click', recheckDevice);
   btnScanPorts.addEventListener('click', () => startPortScan('common'));
   btnScanPortsDeep.addEventListener('click', () => startPortScan('deep'));
 
@@ -151,9 +210,21 @@ document.addEventListener('DOMContentLoaded', () => {
     return dev.id || (dev.mac ? dev.mac : `ip:${dev.ip}`);
   }
 
+  function findDevice(idOrKey) {
+    if (!idOrKey) return null;
+    if (devicesMap.has(idOrKey)) return devicesMap.get(idOrKey);
+    const base = idOrKey.includes('/') ? idOrKey.split('/').pop() : idOrKey;
+    for (const dev of devicesMap.values()) {
+      if (dev.id === idOrKey || dev.id === base || dev.mac === idOrKey || dev.mac === base || dev.ip === idOrKey) {
+        return dev;
+      }
+    }
+    return null;
+  }
+
   function displayName(dev) {
     if (dev.custom_name) return dev.custom_name;
-    if (dev.hostname) return dev.hostname;
+    if (dev.hostname && !isGenericLabel(dev.hostname)) return dev.hostname;
     if (dev.model && !isGenericLabel(dev.model)) return dev.model;
     if (dev.vendor && !isGenericLabel(dev.vendor)) return dev.vendor;
     return dev.ip || 'Discovered Device';
@@ -163,7 +234,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const v = String(s || '').trim().toLowerCase();
     return [
       'apple device', 'generic device', 'network device',
-      'standard network hardware', 'unknown vendor', 'generic', 'device'
+      'standard network hardware', 'unknown vendor', 'generic', 'device',
+      'unknown', 'unknown device',
+      'private / randomized mac', 'private mac', 'randomized mac', 'private / randomized mac address'
     ].includes(v);
   }
 
@@ -171,9 +244,12 @@ document.addEventListener('DOMContentLoaded', () => {
     switch (src) {
       case 'host': return 'This Mac';
       case 'dhcp': return 'Router DHCP';
+      case 'netbios': return 'NetBIOS';
       case 'arp': return 'Bonjour / ARP';
       case 'mdns': return 'Bonjour';
+      case 'upnp': return 'UPnP';
       case 'dns': return 'DNS';
+      case 'tls': return 'TLS Cert';
       case 'cast': return 'Cast';
       case 'http': return 'HTTP title';
       default: return '—';
@@ -186,10 +262,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function upsertDevice(dev) {
     const key = deviceKey(dev);
-    // Drop stale IP-only keys if ID is now available
-    if (dev.id) {
+    // Drop stale keys after remount (same MAC/IP, different scoped id).
+    if (dev.id || dev.mac || dev.ip) {
       for (const [k, v] of devicesMap.entries()) {
-        if (k !== key && v.ip === dev.ip && (!v.id || v.id === dev.id)) {
+        if (k === key) continue;
+        const sameMAC = dev.mac && v.mac && v.mac === dev.mac;
+        const sameIP = dev.ip && v.ip && v.ip === dev.ip;
+        if (sameMAC || sameIP) {
           devicesMap.delete(k);
         }
       }
@@ -199,6 +278,23 @@ document.addEventListener('DOMContentLoaded', () => {
       openDeviceId = key;
       fillDrawer(dev);
     }
+  }
+
+  function fetchVersionInfo() {
+    fetch('/api/version')
+      .then(res => res.json())
+      .then(info => {
+        if (!versionBadgeEl) return;
+        if (info && info.version) {
+          const timeStr = info.build_time && info.build_time !== 'unknown' ? ` • ${info.build_time}` : '';
+          versionBadgeEl.textContent = `v${info.version}${timeStr}`;
+          versionBadgeEl.setAttribute('title', `Gofing v${info.version} (Built: ${info.build_time || 'unknown'})`);
+        }
+      })
+      .catch(err => {
+        console.warn('Failed to fetch version info:', err);
+        if (versionBadgeEl) versionBadgeEl.style.display = 'none';
+      });
   }
 
   function fetchNetworkInfo() {
@@ -222,6 +318,7 @@ document.addEventListener('DOMContentLoaded', () => {
           updateCategoryPills();
           renderTable();
           updateMetrics();
+          renderFilteredActivity();
         }
         if (data.is_scanning) setScanningState(true);
       })
@@ -231,6 +328,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const ACTIVITY_MAX = 100;
   const FEED_TYPES = new Set(['alert', 'online', 'offline', 'found']);
   const recentFeedAt = new Map();
+  let activityEventsList = [];
+  let currentActivityFilter = 'all'; // 'all' | 'online' | 'offline'
 
   function formatFeedTime(isoStr) {
     if (!isoStr) return '';
@@ -241,13 +340,58 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function getActivityStatus(ev) {
+    const rule = ev.rule || '';
+    const typ = ev.type || '';
+    if (rule === 'device_online' || typ === 'online') return 'online';
+    if (rule === 'device_offline' || typ === 'offline') return 'offline';
+    if (rule === 'new_device' || typ === 'found') return 'found';
+    if (typ === 'alert') return 'alert';
+    return 'event';
+  }
+
+  function matchesActivityFilter(ev) {
+    if (currentActivityFilter === 'all') return true;
+    const st = getActivityStatus(ev);
+    if (currentActivityFilter === 'online') {
+      return st === 'online' || st === 'found';
+    }
+    if (currentActivityFilter === 'offline') {
+      return st === 'offline';
+    }
+    return true;
+  }
+
   function activityItemHTML(ev) {
     const typ = ev.type || ev.rule || 'event';
-    const isAlert = typ === 'alert' || !!ev.rule;
-    return `<li class="activity-item${isAlert ? ' alert' : ''}" data-type="${escapeHtml(typ)}">
-      <span class="act-time">${escapeHtml(formatFeedTime(ev.timestamp))}</span>
+    const st = getActivityStatus(ev);
+    const statusClass = `status-${st}`;
+    const devId = ev.device_id || '';
+    const dev = devId ? findDevice(devId) : null;
+    const isClickable = !!dev;
+    const titleAttr = isClickable ? `Click to inspect ${displayName(dev)}` : '';
+
+    return `<li class="activity-item ${statusClass}${isClickable ? ' is-clickable' : ''}" data-type="${escapeHtml(typ)}" data-device-id="${escapeHtml(devId)}" ${titleAttr ? `title="${escapeHtml(titleAttr)}"` : ''}>
+      <span class="act-time">
+        <span class="act-dot"></span>
+        ${escapeHtml(formatFeedTime(ev.timestamp))}
+      </span>
       <span class="act-msg">${escapeHtml(ev.message || '')}</span>
+      ${isClickable ? `<span class="act-hint">Inspect <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg></span>` : ''}
     </li>`;
+  }
+
+  function renderFilteredActivity() {
+    if (!activityFeed) return;
+    const filtered = activityEventsList.filter(matchesActivityFilter);
+    if (!filtered.length) {
+      const msg = currentActivityFilter === 'all'
+        ? 'No recent activity'
+        : `No recent ${currentActivityFilter} activity`;
+      activityFeed.innerHTML = `<li class="activity-empty">${escapeHtml(msg)}</li>`;
+      return;
+    }
+    activityFeed.innerHTML = filtered.slice(0, ACTIVITY_MAX).map(activityItemHTML).join('');
   }
 
   function prependActivity(ev) {
@@ -258,21 +402,17 @@ document.addEventListener('DOMContentLoaded', () => {
     if (prev && now - prev < 2000) return;
     recentFeedAt.set(key, now);
 
-    const empty = activityFeed.querySelector('.activity-empty');
-    if (empty) empty.remove();
-    activityFeed.insertAdjacentHTML('afterbegin', activityItemHTML(ev));
-    while (activityFeed.children.length > ACTIVITY_MAX) {
-      activityFeed.removeChild(activityFeed.lastElementChild);
+    activityEventsList.unshift(ev);
+    if (activityEventsList.length > ACTIVITY_MAX * 2) {
+      activityEventsList.pop();
     }
+    renderFilteredActivity();
   }
 
   function renderActivity(events) {
     const list = (events || []).filter(ev => FEED_TYPES.has(ev.type));
-    if (!list.length) {
-      activityFeed.innerHTML = '<li class="activity-empty">No recent activity</li>';
-      return;
-    }
-    activityFeed.innerHTML = list.slice(0, ACTIVITY_MAX).map(activityItemHTML).join('');
+    activityEventsList = list;
+    renderFilteredActivity();
   }
 
   function fetchActivity() {
@@ -288,6 +428,18 @@ document.addEventListener('DOMContentLoaded', () => {
       .then(s => {
         if (alertsEnabledChk) alertsEnabledChk.checked = !!s.alerts_enabled;
         if (notifyMacosChk) notifyMacosChk.checked = !!s.notify_macos;
+        if (alertOnlineChk) alertOnlineChk.checked = !!s.alert_online;
+        if (alertOfflineChk) alertOfflineChk.checked = !!s.alert_offline;
+        if (alertCooldownSel) {
+          // Snap to the nearest offered preset so a value set via the API
+          // (or clamped by the server) still shows something truthful.
+          const want = Number(s.alert_cooldown_sec || 0);
+          const opts = Array.from(alertCooldownSel.options).map(o => Number(o.value));
+          const nearest = opts.reduce((a, b) =>
+            Math.abs(b - want) < Math.abs(a - want) ? b : a, opts[0]);
+          alertCooldownSel.value = String(nearest);
+        }
+        updateAlertToggleState();
       })
       .catch(err => console.error('Failed to fetch settings:', err));
   }
@@ -311,6 +463,77 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // The per-rule toggles and the damping window only do anything while the
+  // master Alerts switch is on, so reflect that rather than leaving dead
+  // controls enabled.
+  function updateAlertToggleState() {
+    const on = !alertsEnabledChk || alertsEnabledChk.checked;
+    [alertOnlineChk, alertOfflineChk, alertCooldownSel].forEach(el => {
+      if (!el) return;
+      el.disabled = !on;
+      if (el.parentElement) el.parentElement.classList.toggle('is-disabled', !on);
+    });
+  }
+
+  if (alertsEnabledChk) {
+    alertsEnabledChk.addEventListener('change', updateAlertToggleState);
+  }
+  if (alertOnlineChk) {
+    alertOnlineChk.addEventListener('change', () => {
+      patchSettings({ alert_online: alertOnlineChk.checked });
+    });
+  }
+  if (alertOfflineChk) {
+    alertOfflineChk.addEventListener('change', () => {
+      patchSettings({ alert_offline: alertOfflineChk.checked });
+    });
+  }
+  if (alertCooldownSel) {
+    alertCooldownSel.addEventListener('change', () => {
+      patchSettings({ alert_cooldown_sec: Number(alertCooldownSel.value) });
+    });
+  }
+
+  function recheckDevice() {
+    if (!openDeviceId) return;
+    const id = openDeviceId;
+    btnRecheck.disabled = true;
+    toolRecheckStatus.textContent = 'Checking ARP and probing…';
+    if (toolRecheckOutput) toolRecheckOutput.hidden = true;
+
+    fetch(`/api/devices/${encodeURIComponent(id)}/recheck`, { method: 'POST' })
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(r => {
+        // The drawer may have been closed or switched while the probe ran.
+        if (openDeviceId !== id) return;
+        const label = r.is_online ? 'Online' : 'Offline';
+        const via = r.evidence === 'arp' ? 'Layer 2 (ARP)'
+          : r.evidence === 'probe' ? 'active probe'
+          : 'no response';
+        toolRecheckStatus.textContent = `${label} — ${via}`;
+        if (toolRecheckOutput) {
+          toolRecheckOutput.textContent = r.message || '';
+          toolRecheckOutput.hidden = !r.message;
+        }
+        if (r.device) {
+          upsertDevice(r.device);
+          renderTable();
+          updateCategoryPills();
+          updateMetrics();
+        }
+      })
+      .catch(err => {
+        if (openDeviceId !== id) return;
+        toolRecheckStatus.textContent = `Check failed: ${err.message}`;
+      })
+      .finally(() => {
+        if (btnRecheck) btnRecheck.disabled = false;
+      });
+  }
+
   function initSSE() {
     const eventSource = new EventSource('/api/events');
 
@@ -322,6 +545,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateCategoryPills();
         renderTable();
         updateMetrics();
+        renderFilteredActivity();
       }
     });
 
@@ -445,6 +669,17 @@ document.addEventListener('DOMContentLoaded', () => {
           replaceInventory(data.devices);
         }
       } catch (_) { /* ignore */ }
+    });
+
+    eventSource.addEventListener('scan_error', (e) => {
+      setScanningState(false);
+      hideProgress();
+      try {
+        const msg = typeof e.data === 'string' ? e.data : (JSON.parse(e.data) || 'Scan failed');
+        console.error('Scan error:', msg);
+      } catch (_) {
+        console.error('Scan error');
+      }
     });
   }
 
@@ -603,26 +838,41 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function openDrawer(id) {
-    const dev = devicesMap.get(id);
+  function openDrawer(id, targetTab) {
+    const dev = findDevice(id);
     if (!dev) return;
-    openDeviceId = id;
+    openDeviceId = dev.id || id;
     saveStatus.textContent = '';
+    if (toolRecheckStatus) toolRecheckStatus.textContent = '';
+    if (toolRecheckOutput) {
+      toolRecheckOutput.hidden = true;
+      toolRecheckOutput.textContent = '';
+    }
     toolResolveStatus.textContent = '';
     toolResolveStatus.className = 'tool-status';
     toolResolveOutput.hidden = true;
     toolResolveOutput.textContent = '';
+    if (toolProbeStatus) {
+      toolProbeStatus.textContent = '';
+      toolProbeStatus.className = 'tool-status';
+    }
+    if (toolProbeCard) {
+      toolProbeCard.hidden = true;
+      toolProbeCard.innerHTML = '';
+    }
     portsScanStatus.textContent = '';
     portsScanStatus.className = 'tool-status';
     setPortsScanning(false);
-    setActiveTab(activeTab === 'history' ? 'history' : 'overview');
+    setActiveTab(targetTab || (activeTab === 'history' ? 'history' : 'overview'));
     fillDrawer(dev);
     deviceDrawer.classList.add('open');
-    if (activeTab === 'history') loadHistory(id);
+    document.body.classList.add('drawer-open');
+    if (activeTab === 'history') loadHistory(dev.id || id);
   }
 
   function closeDrawer() {
     deviceDrawer.classList.remove('open');
+    document.body.classList.remove('drawer-open');
     openDeviceId = null;
   }
 
@@ -823,6 +1073,103 @@ document.addEventListener('DOMContentLoaded', () => {
       });
   }
 
+  function runDeepProbe() {
+    if (!openDeviceId) return;
+    const id = openDeviceId;
+    if (btnDeepProbe) btnDeepProbe.disabled = true;
+    if (toolProbeStatus) {
+      toolProbeStatus.className = 'tool-status';
+      toolProbeStatus.textContent = 'Probing UPnP, NetBIOS, and TLS…';
+    }
+    if (toolProbeCard) toolProbeCard.hidden = true;
+
+    fetch(`/api/devices/${encodeURIComponent(id)}/probe`, { method: 'POST' })
+      .then(res => {
+        if (!res.ok) throw new Error('probe failed');
+        return res.json();
+      })
+      .then(data => {
+        if (data.device) {
+          upsertDevice(data.device);
+          updateCategoryPills();
+          renderTable();
+          if (openDeviceId === id) fillDrawer(data.device);
+        }
+        const pr = data.probe || {};
+        const hasFindings = !!(pr.upnp || pr.netbios || pr.tls);
+
+        if (toolProbeStatus) {
+          toolProbeStatus.textContent = hasFindings
+            ? 'Deep fingerprint complete — device attributes updated'
+            : 'Probe complete — no responsive UPnP, NetBIOS, or TLS services';
+          toolProbeStatus.className = hasFindings ? 'tool-status ok' : 'tool-status';
+        }
+
+        if (toolProbeCard) {
+          let html = '';
+
+          if (pr.upnp) {
+            html += `<div class="probe-group">
+              <div class="probe-group-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                UPnP / SSDP Descriptor
+              </div>
+              <div class="probe-grid">`;
+            if (pr.upnp.model_name) html += `<span class="probe-key">Model:</span><span class="probe-val font-mono">${escapeHtml(pr.upnp.model_name)}</span>`;
+            if (pr.upnp.model_number) html += `<span class="probe-key">Model Number:</span><span class="probe-val font-mono">${escapeHtml(pr.upnp.model_number)}</span>`;
+            if (pr.upnp.manufacturer) html += `<span class="probe-key">Manufacturer:</span><span class="probe-val">${escapeHtml(pr.upnp.manufacturer)}</span>`;
+            if (pr.upnp.friendly_name) html += `<span class="probe-key">Friendly Name:</span><span class="probe-val">${escapeHtml(pr.upnp.friendly_name)}</span>`;
+            if (pr.upnp.presentation_url) {
+              html += `<span class="probe-key">Web Console:</span><span class="probe-val"><a class="probe-link font-mono" href="${escapeHtml(pr.upnp.presentation_url)}" target="_blank" rel="noopener">${escapeHtml(pr.upnp.presentation_url)}</a></span>`;
+            }
+            html += `</div></div>`;
+          }
+
+          if (pr.netbios) {
+            html += `<div class="probe-group">
+              <div class="probe-group-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                NetBIOS Name Service
+              </div>
+              <div class="probe-grid">`;
+            if (pr.netbios.computer_name) html += `<span class="probe-key">Computer:</span><span class="probe-val font-mono">${escapeHtml(pr.netbios.computer_name)}</span>`;
+            if (pr.netbios.workgroup) html += `<span class="probe-key">Workgroup:</span><span class="probe-val font-mono">${escapeHtml(pr.netbios.workgroup)}</span>`;
+            if (pr.netbios.user_name) html += `<span class="probe-key">User:</span><span class="probe-val font-mono">${escapeHtml(pr.netbios.user_name)}</span>`;
+            if (pr.netbios.mac) html += `<span class="probe-key">Reported MAC:</span><span class="probe-val font-mono">${escapeHtml(pr.netbios.mac)}</span>`;
+            html += `</div></div>`;
+          }
+
+          if (pr.tls) {
+            html += `<div class="probe-group">
+              <div class="probe-group-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                TLS Certificate (Port ${pr.tls.port})
+              </div>
+              <div class="probe-grid">`;
+            if (pr.tls.subject_cn) html += `<span class="probe-key">Common Name:</span><span class="probe-val font-mono">${escapeHtml(pr.tls.subject_cn)}</span>`;
+            if (pr.tls.issuer_org) html += `<span class="probe-key">Issuer:</span><span class="probe-val">${escapeHtml(pr.tls.issuer_org)}</span>`;
+            if (pr.tls.sans && pr.tls.sans.length) html += `<span class="probe-key">Alt Names:</span><span class="probe-val font-mono">${escapeHtml(pr.tls.sans.join(', '))}</span>`;
+            html += `</div></div>`;
+          }
+
+          if (html) {
+            toolProbeCard.innerHTML = html;
+            toolProbeCard.hidden = false;
+          }
+        }
+      })
+      .catch(err => {
+        console.error('Deep probe failed:', err);
+        if (toolProbeStatus) {
+          toolProbeStatus.textContent = 'Probe request failed';
+          toolProbeStatus.className = 'tool-status err';
+        }
+      })
+      .finally(() => {
+        if (btnDeepProbe) btnDeepProbe.disabled = false;
+      });
+  }
+
   const simpleIconSlugs = {
     "apple, inc.": "apple",
     "raspberry pi trading ltd": "raspberrypi",
@@ -856,7 +1203,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const vendorLower = (dev.vendor || '').toLowerCase();
     const slug = simpleIconSlugs[vendorLower];
     if (slug) {
-      return `<img class="simple-icon" src="https://cdn.jsdelivr.net/npm/simple-icons@v11/icons/${slug}.svg" width="${size}" height="${size}" alt="${escapeHtml(dev.vendor)}" onerror="this.outerHTML=getCategorySVG('${dev.icon}', '${dev.device_type}', ${size})" />`;
+      const icon = escapeHtml(dev.icon || '');
+      const dtype = escapeHtml(displayType(dev));
+      const alt = escapeHtml(dev.vendor || '');
+      return `<img class="simple-icon" src="https://cdn.jsdelivr.net/npm/simple-icons@v11/icons/${slug}.svg" width="${size}" height="${size}" alt="${alt}" onerror="this.outerHTML=getCategorySVG('${icon}', '${dtype}', ${size})" />`;
     }
     return getCategorySVG(dev.icon, displayType(dev), size);
   }
